@@ -6,3 +6,11 @@ __pycache__/
 .Trashes
 .Spotlight*
 .DS_Store
+*.pyc
+__pycache__/
+.vscode/
+.idea/
+*.mpy
+.Trashes
+.Spotlight*
+.DS_Store
