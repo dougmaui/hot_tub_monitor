@@ -1,254 +1,170 @@
-# Version: 2.3
+# wifi_manager.py
+"""
+WiFi Manager Module for ESP32-S3 CircuitPython
+Provides reliable WiFi connectivity with automatic recovery
+"""
 
-from time import sleep, monotonic
+import time
 import wifi
-import os
-import array
-import math
-
-# Configuration
-START_HOURS, START_MINUTES, START_SECONDS = 0, 0, 0  # Start time: 00:00:00
-BUFFER_SECONDS = 60  # Store last 60 seconds of RSSI and channel
-DIAG_INTERVAL = 240  # Diagnostics every 1 minute (240 cycles at 0.25 s)
-SAMPLE_INTERVAL = 0.25  # Sample every 0.25 seconds (4 Hz)
-BUFFER_SIZE = int(BUFFER_SECONDS / SAMPLE_INTERVAL)  # 240 entries for 60 seconds
-RSSI_OUTLIER_THRESHOLD = 5  # dBm deviation for outlier detection
-
-# Circular buffers for RSSI, channel, and timestamps
-rssi_buffer = array.array("i", [0] * BUFFER_SIZE)  # Signed int for RSSI
-channel_buffer = array.array("i", [0] * BUFFER_SIZE)  # Signed int for channel
-buffer_timestamps = array.array("f", [0.0] * BUFFER_SIZE)  # Float for monotonic()
-buffer_index = 0
-
-# Variability tracking
-rssi_samples = []  # Store valid RSSI for variability calculation
-RSSI_WINDOW = BUFFER_SIZE  # 240 samples for 60 seconds
-outlier_count = 0  # Count RSSI outliers (>5 dBm from mean)
-
-start_time = monotonic()
+import socketpool
+import gc
 
 
-# Function to add seconds to time
-def add_seconds_direct(hours, minutes, seconds, n):
-    total_seconds = hours * 3600 + minutes * 60 + seconds + n
-    new_hours = total_seconds // 3600
-    total_seconds %= 3600
-    new_minutes = total_seconds // 60
-    new_seconds = total_seconds % 60
-    return f"{new_hours:02d}:{new_minutes:02d}:{new_seconds:02d}"
+class WiFiConfig:
+    """Configuration constants - move to config.py later"""
+
+    RSSI_THRESHOLD = -75
+    RSSI_GOOD = -70
+    SCAN_TIMEOUT = 5.0
+    CONNECT_TIMEOUT = 10.0
+    TICK_INTERVAL = 0.05
 
 
-# Function to dump buffer
-def dump_buffer(current_time, cycle_count, pre_dropout_start=None):
-    print(
-        f"[{current_time}] Cycle {cycle_count}: Buffer contents (last {BUFFER_SECONDS} seconds):"
-    )
-    if pre_dropout_start is not None:
-        start_cycle = pre_dropout_start
-    else:
-        start_cycle = cycle_count - BUFFER_SIZE + 1
-    data = [
-        {
-            "cycle": start_cycle + i,
-            "time": add_seconds_direct(
-                START_HOURS, START_MINUTES, START_SECONDS, int(t - start_time)
-            ),
-            "rssi": r,
-            "channel": c,
-        }
-        for i, (t, r, c) in enumerate(
-            zip(buffer_timestamps, rssi_buffer, channel_buffer)
-        )
-        if r != -999 and c != 0
-    ]
-    for entry in data:
-        print(
-            f"  Cycle {entry['cycle']}: {entry['time']}: RSSI {entry['rssi']} dBm, Channel {entry['channel']}"
-        )
-    print(f"[{current_time}] Printed {len(data)} values")
-    return len(data)
+class WiFiManager:
+    """Manages WiFi connectivity with reliability focus"""
 
+    # State constants
+    INIT = "INIT"
+    SCANNING = "SCANNING"
+    CONNECTING = "CONNECTING"
+    CONNECTED = "CONNECTED"
+    DISCONNECTED = "DISCONNECTED"
 
-# Connect to Wi-Fi
-try:
-    wifi.radio.enabled = True
-    wifi.radio.connect(os.getenv("WIFI_SSID"), os.getenv("WIFI_PASSWORD"))
-    print("Wi-Fi connected")
-except Exception as e:
-    print(f"Wi-Fi connection failed: {e}")
+    def __init__(self, ssid, password, rssi_threshold=None, start_time=None):
+        """Initialize WiFi Manager"""
+        # Basic config
+        self.ssid = ssid
+        self.password = password
+        self.rssi_threshold = rssi_threshold or WiFiConfig.RSSI_THRESHOLD
 
-# Print initial info
-print("IP:", wifi.radio.ipv4_address or "Not connected")
+        # State
+        self.state = self.INIT
+        self._scan_timer = 0
+        self._connect_timer = 0
 
-cycle_count = 0
-last_connected = True
-dropout_detected = False
-in_simulated_dropout = False
-pre_dropout_cycle = None
+        # Time management
+        self.monotonic_start = time.monotonic()
+        self.base_seconds = 0
+        if start_time:
+            try:
+                h, m, s = map(int, start_time.split(":"))
+                self.base_seconds = h * 3600 + m * 60 + s
+            except:
+                print("Invalid time format, using 00:00:00")
 
-while True:
-    try:
-        cycle_count += 1
+        # Connection info
+        self.current_rssi = 0
+        self.current_channel = 0
 
-        # Calculate uptime
-        uptime_seconds = monotonic() - start_time
-        hours = int(uptime_seconds // 3600)
-        minutes = int((uptime_seconds % 3600) // 60)
-        seconds = int(uptime_seconds % 60)
-        current_time = add_seconds_direct(
-            START_HOURS, START_MINUTES, START_SECONDS, int(uptime_seconds)
-        )
+        # Module coordination
+        self.busy_flag = False
+        self.measuring = False
 
-        # Read RSSI and channel
-        rssi = None
-        channel = None
-        try:
-            ap = wifi.radio.ap_info
-            if ap and not in_simulated_dropout:
-                rssi = ap.rssi
-                channel = ap.channel
-                if not last_connected:
-                    print(
-                        f"[{current_time}] Cycle {cycle_count}: Reconnected after dropout"
-                    )
-                    dump_buffer(current_time, cycle_count, pre_dropout_cycle)
-                    dropout_detected = True
-                last_connected = True
+        print(f"{self.get_timestamp()} WiFi Manager initialized for {ssid}")
+
+    def tick(self):
+        """Main update cycle - never blocks >100ms"""
+        if self.state == self.INIT:
+            self.state = self.SCANNING
+            self._scan_timer = time.monotonic()
+            print(f"{self.get_timestamp()} Starting network scan...")
+
+        elif self.state == self.SCANNING:
+            # For now, skip scan and try direct connect
+            if time.monotonic() - self._scan_timer > 1:
+                self.state = self.CONNECTING
+                self._connect_timer = time.monotonic()
+                print(f"{self.get_timestamp()} Attempting connection...")
+
+        elif self.state == self.CONNECTING:
+            if not wifi.radio.connected:
+                if time.monotonic() - self._connect_timer > WiFiConfig.CONNECT_TIMEOUT:
+                    print(f"{self.get_timestamp()} Connection timeout")
+                    self.state = self.DISCONNECTED
+                else:
+                    # Try to connect
+                    try:
+                        print(f"{self.get_timestamp()} Connecting to {self.ssid}...")
+                        wifi.radio.connect(self.ssid, self.password)
+                    except Exception as e:
+                        print(f"{self.get_timestamp()} Connect error: {e}")
             else:
-                if last_connected and not in_simulated_dropout:
-                    pre_dropout_cycle = cycle_count - 1
-                if last_connected:
-                    dropout_detected = False
-                    last_connected = False
-                rssi = None
-                channel = None
-                print(f"[{current_time}] Cycle {cycle_count}: No active AP")
-        except Exception as e:
-            if last_connected and not in_simulated_dropout:
-                pre_dropout_cycle = cycle_count - 1
-            if last_connected:
-                dropout_detected = False
-                last_connected = False
-            rssi = None
-            channel = None
-            print(f"[{current_time}] Cycle {cycle_count}: AP info error: {e}")
-
-        # Store RSSI and channel in circular buffer (only if connected)
-        if last_connected and not in_simulated_dropout:
-            rssi_buffer[buffer_index] = rssi if rssi is not None else -999
-            channel_buffer[buffer_index] = channel if channel is not None else 0
-            buffer_timestamps[buffer_index] = monotonic()
-            buffer_index = (buffer_index + 1) % BUFFER_SIZE
-
-        # Track RSSI variability
-        if rssi is not None:
-            rssi_samples.append(rssi)
-            if len(rssi_samples) > RSSI_WINDOW:
-                rssi_samples.pop(0)
-            if len(rssi_samples) >= RSSI_WINDOW and cycle_count % DIAG_INTERVAL == 0:
-                mean_rssi = sum(rssi_samples) / len(rssi_samples)
-                variance = sum((x - mean_rssi) ** 2 for x in rssi_samples) / len(
-                    rssi_samples
+                # Connected!
+                self.state = self.CONNECTED
+                self.current_rssi = wifi.radio.ap_info.rssi if wifi.radio.ap_info else 0
+                self.current_channel = (
+                    wifi.radio.ap_info.channel if wifi.radio.ap_info else 0
                 )
-                std_dev = math.sqrt(variance) if variance > 0 else 0
-                min_rssi = min(rssi_samples)
-                max_rssi = max(rssi_samples)
-                outliers = sum(
-                    1
-                    for x in rssi_samples
-                    if abs(x - mean_rssi) > RSSI_OUTLIER_THRESHOLD
-                )
-                outlier_count += outliers
                 print(
-                    f"[{current_time}] Cycle {cycle_count}: RSSI Variability (last 60s): Mean {mean_rssi:.1f} dBm, Std Dev {std_dev:.1f} dBm, Min {min_rssi} dBm, Max {max_rssi} dBm, Outliers {outliers}, Total Outliers {outlier_count}"
+                    f"{self.get_timestamp()} Connected! RSSI: {self.current_rssi} Ch: {self.current_channel}"
                 )
+                print(f"{self.get_timestamp()} IP: {wifi.radio.ipv4_address}")
 
-        # Periodic reconnection with retry
-        if not last_connected and cycle_count % 40 == 0 and not in_simulated_dropout:
-            for _ in range(3):
-                try:
-                    wifi.radio.enabled = True
-                    wifi.radio.connect(
-                        os.getenv("WIFI_SSID"), os.getenv("WIFI_PASSWORD")
-                    )
-                    sleep(0.5)
-                    if wifi.radio.connected:
-                        print(f"[{current_time}] Cycle {cycle_count}: Reconnected")
-                        if not dropout_detected:
-                            print(
-                                f"[{current_time}] Cycle {cycle_count}: Reconnected after dropout"
-                            )
-                            dump_buffer(current_time, cycle_count)
-                            dropout_detected = True
-                        last_connected = True
-                        break
-                except Exception as e:
-                    print(
-                        f"[{current_time}] Cycle {cycle_count}: Reconnect failed: {e}"
-                    )
-                    sleep(0.5)
-            if not last_connected:
-                print(
-                    f"[{current_time}] Cycle {cycle_count}: All reconnect attempts failed"
-                )
+        elif self.state == self.CONNECTED:
+            # Monitor connection
+            if not wifi.radio.connected:
+                print(f"{self.get_timestamp()} Connection lost")
+                self.state = self.DISCONNECTED
+            else:
+                # Update RSSI
+                if wifi.radio.ap_info:
+                    self.current_rssi = wifi.radio.ap_info.rssi
 
-        # Debug: Print buffer status before dropout
-        if cycle_count == 479:
-            print(f"[{current_time}] Cycle {cycle_count}: Pre-dropout buffer status:")
-            dump_buffer(current_time, cycle_count)
+        elif self.state == self.DISCONNECTED:
+            # Wait a bit then retry
+            self.state = self.INIT
 
-        # Debug: Print buffer index at cycle 120 and 240
-        if cycle_count in (120, 240):
-            print(f"[{current_time}] Cycle {cycle_count}: Buffer index: {buffer_index}")
+    def get_timestamp(self):
+        """Always returns useful time string"""
+        elapsed = int(time.monotonic() - self.monotonic_start)
+        total = self.base_seconds + elapsed
+        h = (total // 3600) % 24
+        m = (total % 3600) // 60
+        s = total % 60
+        return f"{h:02d}:{m:02d}:{s:02d}"
 
-        # Simulate 2-minute dropout
-        if cycle_count == 480:  # ~2 minutes (120s / 0.25s = 480 cycles)
-            print(f"[{current_time}] Cycle {cycle_count}: Simulating Wi-Fi dropout")
-            wifi.radio.enabled = False
-            wifi.radio.stop_station()
-            in_simulated_dropout = True
-        if cycle_count == 960:  # ~4 minutes (240s / 0.25s = 960 cycles)
-            print(f"[{current_time}] Cycle {cycle_count}: Ending simulated dropout")
-            wifi.radio.enabled = True
-            in_simulated_dropout = False
-            sleep(0.5)
-            for _ in range(3):
-                try:
-                    wifi.radio.connect(
-                        os.getenv("WIFI_SSID"), os.getenv("WIFI_PASSWORD")
-                    )
-                    sleep(0.5)
-                    if wifi.radio.connected:
-                        print(
-                            f"[{current_time}] Cycle {cycle_count}: Reconnected (post-dropout)"
-                        )
-                        if not dropout_detected:
-                            print(
-                                f"[{current_time}] Cycle {cycle_count}: Reconnected after dropout"
-                            )
-                            dump_buffer(current_time, cycle_count, pre_dropout_cycle)
-                            dropout_detected = True
-                        last_connected = True
-                        break
-                except Exception as e:
-                    print(
-                        f"[{current_time}] Cycle {cycle_count}: Post-dropout reconnect failed: {e}"
-                    )
-                    sleep(0.5)
+    def is_available(self):
+        """Check if WiFi is connected and stable"""
+        return self.state == self.CONNECTED and self.current_rssi > self.rssi_threshold
 
-        # Diagnostics (every 1 minute)
-        if cycle_count % DIAG_INTERVAL == 0:
-            print(
-                f"[{current_time}] Cycle {cycle_count}: RSSI: {rssi if rssi is not None else 'N/A'} dBm, Channel: {channel if channel is not None else 'N/A'}"
-            )
+    def get_status(self):
+        """Get current status dict"""
+        return {
+            "state": self.state,
+            "rssi": self.current_rssi,
+            "channel": self.current_channel,
+            "ssid": self.ssid if self.state == self.CONNECTED else None,
+            "connected": wifi.radio.connected,
+        }
 
-        sleep(SAMPLE_INTERVAL)
 
-    except KeyboardInterrupt:
-        print(f"[{current_time}] Cycle {cycle_count}: KeyboardInterrupt detected")
-        dump_buffer(current_time, cycle_count)
-        raise
-    except Exception as e:
-        print(f"[{current_time}] Cycle {cycle_count}: ERROR: Unexpected error: {e}")
-        dump_buffer(current_time, cycle_count)
-        sleep(SAMPLE_INTERVAL)
+# Test code
+def main():
+    """Test WiFi Manager standalone"""
+    # Get credentials from settings.toml or use defaults
+    import os
+
+    ssid = os.getenv("WIFI_SSID", "TestNetwork")
+    password = os.getenv("WIFI_PASSWORD", "testpass")
+
+    print(f"Starting WiFi Manager test with SSID: {ssid}")
+
+    wifi_mgr = WiFiManager(ssid, password, start_time="12:00:00")
+
+    last_status = time.monotonic()
+
+    while True:
+        wifi_mgr.tick()
+
+        # Status every 5 seconds
+        if time.monotonic() - last_status > 5:
+            status = wifi_mgr.get_status()
+            print(f"{wifi_mgr.get_timestamp()} Status: {status}")
+            print(f"  Free memory: {gc.mem_free()} bytes")
+            last_status = time.monotonic()
+
+        time.sleep(WiFiConfig.TICK_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
