@@ -8,6 +8,7 @@ import time
 import wifi
 import gc
 import array
+import microcontroller
 
 
 class WiFiConfig:
@@ -21,6 +22,10 @@ class WiFiConfig:
     HISTORY_SIZE = 60  # Reduced from 256
     MEMORY_WARNING = 50000  # 50KB warning threshold
 
+    # Watchdog settings
+    CONNECTION_WATCHDOG_TIMEOUT = 3600  # 1 hour default
+    RETRY_BACKOFF_MAX = 300  # Max 5 minutes between retries
+
 
 class WiFiManager:
     """Manages WiFi connectivity with reliability focus"""
@@ -32,7 +37,14 @@ class WiFiManager:
     CONNECTED = "CONNECTED"
     DISCONNECTED = "DISCONNECTED"
 
-    def __init__(self, ssid, password, rssi_threshold=None, start_time=None):
+    def __init__(
+        self,
+        ssid,
+        password,
+        rssi_threshold=None,
+        start_time=None,
+        watchdog_timeout=None,
+    ):
         """Initialize WiFi Manager"""
         # Basic config
         self.ssid = ssid
@@ -82,6 +94,18 @@ class WiFiManager:
         # RSSI warning tracking
         self._last_rssi_warning = 0
         self._rssi_was_good = True
+        self._low_rssi_start = None
+        self._in_connected_state = False
+
+        # Watchdog tracking
+        self.watchdog_timeout = (
+            watchdog_timeout or WiFiConfig.CONNECTION_WATCHDOG_TIMEOUT
+        )
+        self.last_connected_time = time.monotonic()  # Last time we had good connection
+        self.disconnected_since = None  # When current disconnect started
+        self.retry_delay = 2  # Starting retry delay
+        self.retry_count = 0
+        self._disconnect_time = 0
 
         print(f"{self.get_timestamp()} WiFi Manager initialized for {ssid}")
         print(f"  Free memory: {gc.mem_free()} bytes")
@@ -94,11 +118,38 @@ class WiFiManager:
             self._check_memory()
             self._last_gc = now
 
+        # Check watchdog timer
+        if self.state != self.CONNECTED:
+            if self.disconnected_since is None:
+                self.disconnected_since = now
+                print(
+                    f"{self.get_timestamp()} Disconnected - starting watchdog timer ({self.watchdog_timeout}s)"
+                )
+
+            # Check if we've exceeded watchdog timeout
+            disconnect_duration = now - self.disconnected_since
+            if disconnect_duration > self.watchdog_timeout:
+                print(
+                    f"{self.get_timestamp()} WATCHDOG: No connection for {disconnect_duration:.0f}s"
+                )
+                print(f"{self.get_timestamp()} WATCHDOG: Initiating hard reset...")
+
+                # Log final status before reset
+                print(f"  Last connected: {self.last_connected_time}")
+                print(f"  Retry count: {self.retry_count}")
+                print(f"  Free memory: {gc.mem_free()}")
+
+                # Perform hard reset
+                microcontroller.reset()
+
         if self.state == self.INIT:
             self.state = self.SCANNING
             self._scan_timer = time.monotonic()
             self._scan_results = []
-            print(f"{self.get_timestamp()} Starting network scan...")
+            self.retry_count += 1
+            print(
+                f"{self.get_timestamp()} Starting network scan (attempt #{self.retry_count})..."
+            )
 
         elif self.state == self.SCANNING:
             self._scan_for_networks()
@@ -107,12 +158,38 @@ class WiFiManager:
             self._handle_connection()
 
         elif self.state == self.CONNECTED:
+            # Reset watchdog tracking on successful connection
+            self.last_connected_time = now
+            self.disconnected_since = None
+
+            # Only reset retry info if connection is good
+            if self.current_rssi > self.rssi_threshold:
+                self.retry_delay = 2  # Reset retry delay
+                self.retry_count = 0
+
+            # Reset RSSI tracking on fresh connection
+            if not hasattr(self, "_in_connected_state"):
+                self._low_rssi_start = None
+                self._rssi_was_good = True
+                self._in_connected_state = True
             self._monitor_connection()
 
         elif self.state == self.DISCONNECTED:
-            # Wait a bit then retry
-            time.sleep(2)
-            self.state = self.INIT
+            # Progressive retry delay with max limit
+            if now - self._disconnect_time > self.retry_delay:
+                print(
+                    f"{self.get_timestamp()} Waited {self.retry_delay}s, starting retry..."
+                )
+                self.state = self.INIT
+                # Increase delay for next retry (exponential backoff)
+                old_delay = self.retry_delay
+                self.retry_delay = min(
+                    self.retry_delay * 2, WiFiConfig.RETRY_BACKOFF_MAX
+                )
+                if self.retry_delay != old_delay:
+                    print(
+                        f"{self.get_timestamp()} Next retry delay increased to {self.retry_delay}s"
+                    )
 
     def _check_memory(self):
         """Monitor and manage memory"""
@@ -168,8 +245,8 @@ class WiFiManager:
                 for ap in networks[:3]:  # Only print top 3
                     print(f"  Ch{ap['channel']:2d} RSSI:{ap['rssi']:3d} {ap['bssid']}")
 
-                # Select best AP
-                self.target_ap = networks[0]
+                # Note: We cannot control which AP we connect to
+                # CircuitPython will choose one arbitrarily
                 self.state = self.CONNECTING
                 self._connect_timer = time.monotonic()
             else:
@@ -187,10 +264,13 @@ class WiFiManager:
             if time.monotonic() - self._connect_timer > WiFiConfig.CONNECT_TIMEOUT:
                 print(f"{self.get_timestamp()} Connection timeout")
                 self.state = self.DISCONNECTED
+                self._disconnect_time = time.monotonic()  # Track when we disconnected
             else:
                 # Try to connect
                 try:
                     print(f"{self.get_timestamp()} Connecting to {self.ssid}...")
+                    # Note: CircuitPython will choose which AP to connect to
+                    # We cannot control the selection even with BSSID parameter
                     wifi.radio.connect(self.ssid, self.password)
                 except Exception as e:
                     if "Already connected" not in str(e):
@@ -203,9 +283,17 @@ class WiFiManager:
             self.current_channel = (
                 wifi.radio.ap_info.channel if wifi.radio.ap_info else 0
             )
-            print(
-                f"{self.get_timestamp()} Connected! RSSI: {self.current_rssi} Ch: {self.current_channel}"
-            )
+
+            # Log which AP we actually connected to
+            if wifi.radio.ap_info:
+                actual_bssid = ":".join(["%02X" % b for b in wifi.radio.ap_info.bssid])
+                print(
+                    f"{self.get_timestamp()} Connected to {actual_bssid}! RSSI: {self.current_rssi} Ch: {self.current_channel}"
+                )
+            else:
+                print(
+                    f"{self.get_timestamp()} Connected! RSSI: {self.current_rssi} Ch: {self.current_channel}"
+                )
             print(f"{self.get_timestamp()} IP: {wifi.radio.ipv4_address}")
 
     def _monitor_connection(self):
@@ -215,6 +303,10 @@ class WiFiManager:
             print(f"{self.get_timestamp()} Connection lost")
             self.state = self.DISCONNECTED
             self.connected_at = None
+            self._disconnect_time = time.monotonic()
+            self._low_rssi_start = None  # Reset low RSSI tracking
+            self._rssi_was_good = True  # Reset RSSI state
+            self._in_connected_state = False  # Clear connection flag
             return
 
         # Update RSSI periodically
@@ -232,7 +324,7 @@ class WiFiManager:
             if self.history_count < WiFiConfig.HISTORY_SIZE:
                 self.history_count += 1
 
-            # Check if signal too weak - with spam prevention
+            # Check if signal too weak - with spam prevention and reconnection
             if self.current_rssi < self.rssi_threshold:
                 # Only print on transition or every 5 seconds
                 if self._rssi_was_good:  # Just went bad
@@ -241,13 +333,33 @@ class WiFiManager:
                     )
                     self._last_rssi_warning = now
                     self._rssi_was_good = False
+                    self._low_rssi_start = now  # Track when low RSSI started
                 elif now - self._last_rssi_warning > 5:  # Periodic warning
                     print(
                         f"{self.get_timestamp()} WARNING: RSSI still low: {self.current_rssi}"
                     )
                     self._last_rssi_warning = now
+
+                    # Check if we've been in low RSSI state for too long
+                    if self._low_rssi_start and (now - self._low_rssi_start) > 10:
+                        print(
+                            f"{self.get_timestamp()} RSSI too low for too long, disconnecting to rescan"
+                        )
+                        # Force disconnect to trigger rescan
+                        try:
+                            wifi.radio.disconnect()
+                        except:
+                            pass
+                        self.state = self.DISCONNECTED
+                        self.connected_at = None
+                        self._disconnect_time = time.monotonic()
+                        self._low_rssi_start = None  # Reset low RSSI tracking
+                        self._rssi_was_good = True  # Reset RSSI state
+                        self._in_connected_state = False  # Clear connection flag
+                        return
             else:
                 self._rssi_was_good = True  # Signal recovered
+                self._low_rssi_start = None  # Clear the low RSSI timer
 
     def get_timestamp(self):
         """Always returns useful time string"""
@@ -268,6 +380,11 @@ class WiFiManager:
         if self.connected_at:
             uptime = int(time.monotonic() - self.connected_at)
 
+        watchdog_remaining = None
+        if self.disconnected_since:
+            elapsed = time.monotonic() - self.disconnected_since
+            watchdog_remaining = max(0, self.watchdog_timeout - elapsed)
+
         return {
             "state": self.state,
             "rssi": self.current_rssi,
@@ -277,6 +394,8 @@ class WiFiManager:
             "uptime": uptime,
             "history_size": self.history_count,
             "free_memory": gc.mem_free(),
+            "retry_count": self.retry_count,
+            "watchdog_remaining": watchdog_remaining,
         }
 
     def get_rssi_history(self, samples=10):
@@ -298,6 +417,7 @@ class WiFiManager:
 def main():
     """Test WiFi Manager standalone"""
     import os
+    from watchdog import WatchDogMode
 
     ssid = os.getenv("WIFI_SSID", "TestNetwork")
     password = os.getenv("WIFI_PASSWORD", "testpass")
@@ -308,8 +428,17 @@ def main():
 
     last_status = time.monotonic()
 
+    # Set up watchdog - CircuitPython uses WatchDogMode
+    wdt = microcontroller.watchdog
+    wdt.timeout = 5
+    wdt.mode = WatchDogMode.RESET
+    wdt.feed()
+
     while True:
         wifi_mgr.tick()
+
+        # Feed watchdog
+        wdt.feed()
 
         # Status every 5 seconds
         if time.monotonic() - last_status > 5:
