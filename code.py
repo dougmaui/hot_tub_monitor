@@ -1,24 +1,25 @@
-# wifi_manager.py
+# wifi_manager.py - MEMORY OPTIMIZED VERSION
 """
 WiFi Manager Module for ESP32-S3 CircuitPython
-Provides reliable WiFi connectivity with automatic recovery
+Memory-optimized version with leak prevention
 """
 
 import time
 import wifi
-import socketpool
 import gc
+import array
 
 
 class WiFiConfig:
-    """Configuration constants - move to config.py later"""
+    """Configuration constants"""
 
     RSSI_THRESHOLD = -75
     RSSI_GOOD = -70
     SCAN_TIMEOUT = 5.0
     CONNECT_TIMEOUT = 10.0
     TICK_INTERVAL = 0.05
-    HISTORY_SIZE = 256
+    HISTORY_SIZE = 60  # Reduced from 256
+    MEMORY_WARNING = 50000  # 50KB warning threshold
 
 
 class WiFiManager:
@@ -60,18 +61,39 @@ class WiFiManager:
         self.current_bssid = None
         self.connected_at = None
 
-        # RSSI History
-        self.rssi_history = []
-        self._last_rssi_check = 0
+        # RSSI History - Using arrays for memory efficiency
+        self.rssi_values = array.array(
+            "b", [0] * WiFiConfig.HISTORY_SIZE
+        )  # signed byte array
+        self.rssi_times = array.array(
+            "f", [0.0] * WiFiConfig.HISTORY_SIZE
+        )  # float array
+        self.history_index = 0
+        self.history_count = 0
 
         # Module coordination
         self.busy_flag = False
         self.measuring = False
 
+        # Memory monitoring
+        self._last_gc = time.monotonic()
+        self._low_memory_mode = False
+
+        # RSSI warning tracking
+        self._last_rssi_warning = 0
+        self._rssi_was_good = True
+
         print(f"{self.get_timestamp()} WiFi Manager initialized for {ssid}")
+        print(f"  Free memory: {gc.mem_free()} bytes")
 
     def tick(self):
         """Main update cycle - never blocks >100ms"""
+        # Memory check every 10 seconds
+        now = time.monotonic()
+        if now - self._last_gc > 10:
+            self._check_memory()
+            self._last_gc = now
+
         if self.state == self.INIT:
             self.state = self.SCANNING
             self._scan_timer = time.monotonic()
@@ -92,9 +114,38 @@ class WiFiManager:
             time.sleep(2)
             self.state = self.INIT
 
+    def _check_memory(self):
+        """Monitor and manage memory"""
+        free = gc.mem_free()
+
+        if free < WiFiConfig.MEMORY_WARNING:
+            if not self._low_memory_mode:
+                print(f"{self.get_timestamp()} WARNING: Low memory {free} bytes")
+                self._low_memory_mode = True
+
+            # Emergency actions
+            if free < 40000:
+                print(
+                    f"{self.get_timestamp()} CRITICAL: Memory at {free}, collecting garbage"
+                )
+                gc.collect()
+
+                # Clear scan results
+                self._scan_results = []
+
+                # Reduce history if needed
+                if self.history_count > 30:
+                    self.history_count = 30
+
+        else:
+            self._low_memory_mode = False
+
     def _scan_for_networks(self):
         """Scan for available networks"""
         try:
+            # Clear old results first
+            self._scan_results = []
+
             # Start scanning
             networks = []
             for network in wifi.radio.start_scanning_networks():
@@ -114,7 +165,7 @@ class WiFiManager:
                 networks.sort(key=lambda x: x["rssi"], reverse=True)
                 self._scan_results = networks
                 print(f"{self.get_timestamp()} Found {len(networks)} access points:")
-                for ap in networks:
+                for ap in networks[:3]:  # Only print top 3
                     print(f"  Ch{ap['channel']:2d} RSSI:{ap['rssi']:3d} {ap['bssid']}")
 
                 # Select best AP
@@ -168,29 +219,35 @@ class WiFiManager:
 
         # Update RSSI periodically
         now = time.monotonic()
-        if now - self._last_rssi_check > 1.0:  # Check every second
-            self._last_rssi_check = now
-            if wifi.radio.ap_info:
-                self.current_rssi = wifi.radio.ap_info.rssi
+        if wifi.radio.ap_info:
+            self.current_rssi = wifi.radio.ap_info.rssi
 
-                # Add to history
-                entry = {
-                    "time": now - self.monotonic_start,
-                    "rssi": self.current_rssi,
-                    "channel": self.current_channel,
-                }
-                self.rssi_history.append(entry)
+            # Add to history using circular buffer
+            self.rssi_values[self.history_index] = max(
+                -127, min(127, self.current_rssi)
+            )
+            self.rssi_times[self.history_index] = now - self.monotonic_start
 
-                # Limit history size
-                if len(self.rssi_history) > WiFiConfig.HISTORY_SIZE:
-                    self.rssi_history.pop(0)
+            self.history_index = (self.history_index + 1) % WiFiConfig.HISTORY_SIZE
+            if self.history_count < WiFiConfig.HISTORY_SIZE:
+                self.history_count += 1
 
-                # Check if signal too weak
-                if self.current_rssi < self.rssi_threshold:
+            # Check if signal too weak - with spam prevention
+            if self.current_rssi < self.rssi_threshold:
+                # Only print on transition or every 5 seconds
+                if self._rssi_was_good:  # Just went bad
                     print(
-                        f"{self.get_timestamp()} RSSI below threshold: {self.current_rssi}"
+                        f"{self.get_timestamp()} WARNING: RSSI below threshold: {self.current_rssi}"
                     )
-                    # Could trigger rescan here
+                    self._last_rssi_warning = now
+                    self._rssi_was_good = False
+                elif now - self._last_rssi_warning > 5:  # Periodic warning
+                    print(
+                        f"{self.get_timestamp()} WARNING: RSSI still low: {self.current_rssi}"
+                    )
+                    self._last_rssi_warning = now
+            else:
+                self._rssi_was_good = True  # Signal recovered
 
     def get_timestamp(self):
         """Always returns useful time string"""
@@ -218,20 +275,28 @@ class WiFiManager:
             "ssid": self.ssid if self.state == self.CONNECTED else None,
             "connected": wifi.radio.connected,
             "uptime": uptime,
-            "history_size": len(self.rssi_history),
+            "history_size": self.history_count,
+            "free_memory": gc.mem_free(),
         }
 
-    def get_rssi_history(self, samples=60):
-        """Get recent RSSI samples"""
-        if samples >= len(self.rssi_history):
-            return self.rssi_history
-        return self.rssi_history[-samples:]
+    def get_rssi_history(self, samples=10):
+        """Get recent RSSI samples efficiently"""
+        if samples > self.history_count:
+            samples = self.history_count
+
+        result = []
+        start_idx = (self.history_index - samples) % WiFiConfig.HISTORY_SIZE
+
+        for i in range(samples):
+            idx = (start_idx + i) % WiFiConfig.HISTORY_SIZE
+            result.append(self.rssi_values[idx])
+
+        return result
 
 
 # Test code
 def main():
     """Test WiFi Manager standalone"""
-    # Get credentials from settings.toml or use defaults
     import os
 
     ssid = os.getenv("WIFI_SSID", "TestNetwork")
@@ -239,7 +304,7 @@ def main():
 
     print(f"Starting WiFi Manager test with SSID: {ssid}")
 
-    wifi_mgr = WiFiManager(ssid, password, start_time="17:38:00")
+    wifi_mgr = WiFiManager(ssid, password, start_time="12:00:00")
 
     last_status = time.monotonic()
 
@@ -250,13 +315,11 @@ def main():
         if time.monotonic() - last_status > 5:
             status = wifi_mgr.get_status()
             print(f"{wifi_mgr.get_timestamp()} Status: {status}")
-            print(f"  Free memory: {gc.mem_free()} bytes")
 
             # Show RSSI trend
             history = wifi_mgr.get_rssi_history(10)
             if history:
-                rssi_values = [h["rssi"] for h in history]
-                print(f"  RSSI trend: {rssi_values}")
+                print(f"  RSSI trend: {history}")
 
             last_status = time.monotonic()
 
