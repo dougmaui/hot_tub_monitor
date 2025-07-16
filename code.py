@@ -10,21 +10,7 @@ import gc
 import array
 import microcontroller
 
-
-class WiFiConfig:
-    """Configuration constants"""
-
-    RSSI_THRESHOLD = -75
-    RSSI_GOOD = -70
-    SCAN_TIMEOUT = 5.0
-    CONNECT_TIMEOUT = 10.0
-    TICK_INTERVAL = 0.05
-    HISTORY_SIZE = 60  # Reduced from 256
-    MEMORY_WARNING = 50000  # 50KB warning threshold
-
-    # Watchdog settings
-    CONNECTION_WATCHDOG_TIMEOUT = 3600  # 1 hour default
-    RETRY_BACKOFF_MAX = 300  # Max 5 minutes between retries
+from config import WiFiConfig
 
 
 class WiFiManager:
