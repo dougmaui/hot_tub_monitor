@@ -59,16 +59,6 @@ class WiFiManager:
         self.current_bssid = None
         self.connected_at = None
 
-        # RSSI History - Using arrays for memory efficiency
-        self.rssi_values = array.array(
-            "b", [0] * WiFiConfig.HISTORY_SIZE
-        )  # signed byte array
-        self.rssi_times = array.array(
-            "f", [0.0] * WiFiConfig.HISTORY_SIZE
-        )  # float array
-        self.history_index = 0
-        self.history_count = 0
-
         # Module coordination
         self.busy_flag = False
         self.measuring = False
@@ -297,18 +287,8 @@ class WiFiManager:
 
         # Update RSSI periodically
         now = time.monotonic()
-        if wifi.radio.ap_info:
+        if wifi.radio.ap_info and self.can_measure():
             self.current_rssi = wifi.radio.ap_info.rssi
-
-            # Add to history using circular buffer
-            self.rssi_values[self.history_index] = max(
-                -127, min(127, self.current_rssi)
-            )
-            self.rssi_times[self.history_index] = now - self.monotonic_start
-
-            self.history_index = (self.history_index + 1) % WiFiConfig.HISTORY_SIZE
-            if self.history_count < WiFiConfig.HISTORY_SIZE:
-                self.history_count += 1
 
             # Check if signal too weak - with spam prevention and reconnection
             if self.current_rssi < self.rssi_threshold:
@@ -327,7 +307,11 @@ class WiFiManager:
                     self._last_rssi_warning = now
 
                     # Check if we've been in low RSSI state for too long
-                    if self._low_rssi_start and (now - self._low_rssi_start) > 10:
+                    if (
+                        self._low_rssi_start
+                        and (now - self._low_rssi_start)
+                        > WiFiConfig.LOW_RSSI_DISCONNECT_TIME
+                    ):
                         print(
                             f"{self.get_timestamp()} RSSI too low for too long, disconnecting to rescan"
                         )
@@ -378,25 +362,21 @@ class WiFiManager:
             "ssid": self.ssid if self.state == self.CONNECTED else None,
             "connected": wifi.radio.connected,
             "uptime": uptime,
-            "history_size": self.history_count,
             "free_memory": gc.mem_free(),
             "retry_count": self.retry_count,
             "watchdog_remaining": watchdog_remaining,
         }
 
-    def get_rssi_history(self, samples=10):
-        """Get recent RSSI samples efficiently"""
-        if samples > self.history_count:
-            samples = self.history_count
+    def will_be_unavailable(self):
+        if self._low_rssi_start:
+            elapsed = time.monotonic() - self._low_rssi_start
+            if elapsed > WiFiConfig.LOW_RSSI_DISCONNECT_TIME:
+                return True
+        return self.state != self.CONNECTED
 
-        result = []
-        start_idx = (self.history_index - samples) % WiFiConfig.HISTORY_SIZE
-
-        for i in range(samples):
-            idx = (start_idx + i) % WiFiConfig.HISTORY_SIZE
-            result.append(self.rssi_values[idx])
-
-        return result
+    def can_measure(self):
+        """Check if safe to measure RSSI (respects MQTT busy flag)"""
+        return not self.busy_flag and self.state == self.CONNECTED
 
 
 # Test code
@@ -430,11 +410,6 @@ def main():
         if time.monotonic() - last_status > 5:
             status = wifi_mgr.get_status()
             print(f"{wifi_mgr.get_timestamp()} Status: {status}")
-
-            # Show RSSI trend
-            history = wifi_mgr.get_rssi_history(10)
-            if history:
-                print(f"  RSSI trend: {history}")
 
             last_status = time.monotonic()
 

@@ -18,9 +18,12 @@ class WiFiConfig:
     TICK_INTERVAL = 0.05  # Main loop interval
 
     # Memory management
-    HISTORY_SIZE = 60  # RSSI history buffer size
     MEMORY_WARNING = 50000  # Memory warning threshold (bytes)
 
     # Watchdog settings
     CONNECTION_WATCHDOG_TIMEOUT = 3600  # 1 hour default
     RETRY_BACKOFF_MAX = 300  # Max 5 minutes between retries
+
+    # Connection quality thresholds
+    LOW_RSSI_DISCONNECT_TIME = 10  # Seconds of low RSSI before disconnect
+    LOW_RSSI_WARNING_TIME = 8  # Seconds before disconnect to warn MQTT
