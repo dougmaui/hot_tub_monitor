@@ -1,420 +1,266 @@
-# wifi_manager.py - MEMORY OPTIMIZED VERSION
+# test_ntp_basic.py - Test script for NTP module basic structure
 """
-WiFi Manager Module for ESP32-S3 CircuitPython
-Memory-optimized version with leak prevention
+Test the NTP module's state machine, retry logic, and coordination
+without actual NTP protocol implementation
 """
 
 import time
-import wifi
 import gc
-import array
-import microcontroller
-
-from config import WiFiConfig
+from ntp_sync import NTPSync
 
 
-class WiFiManager:
-    """Manages WiFi connectivity with reliability focus"""
+def test_basic_sync():
+    """Test basic sync operation"""
+    print("\n=== TEST 1: Basic Sync Operation ===")
+    ntp = NTPSync()
 
-    # State constants
-    INIT = "INIT"
-    SCANNING = "SCANNING"
-    CONNECTING = "CONNECTING"
-    CONNECTED = "CONNECTED"
-    DISCONNECTED = "DISCONNECTED"
+    # Should start in UNSYNCED state
+    print(f"Initial state: {ntp.state}")
+    assert ntp.state == NTPSync.UNSYNCED
+    assert not ntp.is_synced()
+    assert ntp.get_time_quality() == "manual"
 
-    def __init__(
-        self,
-        ssid,
-        password,
-        rssi_threshold=None,
-        start_time=None,
-        watchdog_timeout=None,
-    ):
-        """Initialize WiFi Manager"""
-        # Basic config
-        self.ssid = ssid
-        self.password = password
-        self.rssi_threshold = rssi_threshold or WiFiConfig.RSSI_THRESHOLD
+    # First tick should start sync immediately
+    ntp.tick()
+    print(f"After first tick: {ntp.state}")
+    assert ntp.state == NTPSync.SYNCING
 
-        # State
-        self.state = self.INIT
-        self._scan_timer = 0
-        self._connect_timer = 0
-        self._scan_results = []
+    # Wait for simulated sync to complete (1 second)
+    start = time.monotonic()
+    while time.monotonic() - start < 1.5:
+        ntp.tick()
+        if ntp.just_synced:
+            print(f"Sync completed! State: {ntp.state}")
+            print(f"Time quality: {ntp.get_time_quality()}")
+            print(f"Real timestamp: {ntp.get_real_timestamp()}")
+            break
+        time.sleep(0.05)
 
-        # Time management
-        self.monotonic_start = time.monotonic()
-        self.base_seconds = 0
-        if start_time:
-            try:
-                h, m, s = map(int, start_time.split(":"))
-                self.base_seconds = h * 3600 + m * 60 + s
-            except:
-                print("Invalid time format, using 00:00:00")
+    assert ntp.state == NTPSync.SYNCED
+    assert ntp.is_synced()
+    assert ntp.get_time_quality() == "ntp"
 
-        # Connection info
-        self.current_rssi = 0
-        self.current_channel = 0
-        self.current_bssid = None
-        self.connected_at = None
+    # Check that just_synced flag clears
+    ntp.tick()
+    assert not ntp.just_synced
 
-        # Module coordination
-        self.busy_flag = False
-        self.measuring = False
-
-        # Memory monitoring
-        self._last_gc = time.monotonic()
-        self._low_memory_mode = False
-
-        # RSSI warning tracking
-        self._last_rssi_warning = 0
-        self._rssi_was_good = True
-        self._low_rssi_start = None
-        self._in_connected_state = False
-
-        # Watchdog tracking
-        self.watchdog_timeout = (
-            watchdog_timeout or WiFiConfig.CONNECTION_WATCHDOG_TIMEOUT
-        )
-        self.last_connected_time = time.monotonic()  # Last time we had good connection
-        self.disconnected_since = None  # When current disconnect started
-        self.retry_delay = 2  # Starting retry delay
-        self.retry_count = 0
-        self._disconnect_time = 0
-
-        print(f"{self.get_timestamp()} WiFi Manager initialized for {ssid}")
-        print(f"  Free memory: {gc.mem_free()} bytes")
-
-    def tick(self):
-        """Main update cycle - never blocks >100ms"""
-        # Memory check every 10 seconds
-        now = time.monotonic()
-        if now - self._last_gc > 10:
-            self._check_memory()
-            self._last_gc = now
-
-        # Check watchdog timer
-        if self.state != self.CONNECTED:
-            if self.disconnected_since is None:
-                self.disconnected_since = now
-                print(
-                    f"{self.get_timestamp()} Disconnected - starting watchdog timer ({self.watchdog_timeout}s)"
-                )
-
-            # Check if we've exceeded watchdog timeout
-            disconnect_duration = now - self.disconnected_since
-            if disconnect_duration > self.watchdog_timeout:
-                print(
-                    f"{self.get_timestamp()} WATCHDOG: No connection for {disconnect_duration:.0f}s"
-                )
-                print(f"{self.get_timestamp()} WATCHDOG: Initiating hard reset...")
-
-                # Log final status before reset
-                print(f"  Last connected: {self.last_connected_time}")
-                print(f"  Retry count: {self.retry_count}")
-                print(f"  Free memory: {gc.mem_free()}")
-
-                # Perform hard reset
-                microcontroller.reset()
-
-        if self.state == self.INIT:
-            self.state = self.SCANNING
-            self._scan_timer = time.monotonic()
-            self._scan_results = []
-            self.retry_count += 1
-            print(
-                f"{self.get_timestamp()} Starting network scan (attempt #{self.retry_count})..."
-            )
-
-        elif self.state == self.SCANNING:
-            self._scan_for_networks()
-
-        elif self.state == self.CONNECTING:
-            self._handle_connection()
-
-        elif self.state == self.CONNECTED:
-            # Reset watchdog tracking on successful connection
-            self.last_connected_time = now
-            self.disconnected_since = None
-
-            # Only reset retry info if connection is good
-            if self.current_rssi > self.rssi_threshold:
-                self.retry_delay = 2  # Reset retry delay
-                self.retry_count = 0
-
-            # Reset RSSI tracking on fresh connection
-            if not hasattr(self, "_in_connected_state"):
-                self._low_rssi_start = None
-                self._rssi_was_good = True
-                self._in_connected_state = True
-            self._monitor_connection()
-
-        elif self.state == self.DISCONNECTED:
-            # Progressive retry delay with max limit
-            if now - self._disconnect_time > self.retry_delay:
-                print(
-                    f"{self.get_timestamp()} Waited {self.retry_delay}s, starting retry..."
-                )
-                self.state = self.INIT
-                # Increase delay for next retry (exponential backoff)
-                old_delay = self.retry_delay
-                self.retry_delay = min(
-                    self.retry_delay * 2, WiFiConfig.RETRY_BACKOFF_MAX
-                )
-                if self.retry_delay != old_delay:
-                    print(
-                        f"{self.get_timestamp()} Next retry delay increased to {self.retry_delay}s"
-                    )
-
-    def _check_memory(self):
-        """Monitor and manage memory"""
-        free = gc.mem_free()
-
-        if free < WiFiConfig.MEMORY_WARNING:
-            if not self._low_memory_mode:
-                print(f"{self.get_timestamp()} WARNING: Low memory {free} bytes")
-                self._low_memory_mode = True
-
-            # Emergency actions
-            if free < 40000:
-                print(
-                    f"{self.get_timestamp()} CRITICAL: Memory at {free}, collecting garbage"
-                )
-                gc.collect()
-
-                # Clear scan results
-                self._scan_results = []
-
-                # Reduce history if needed
-                if self.history_count > 30:
-                    self.history_count = 30
-
-        else:
-            self._low_memory_mode = False
-
-    def _scan_for_networks(self):
-        """Scan for available networks"""
-        try:
-            # Clear old results first
-            self._scan_results = []
-
-            # Start scanning
-            networks = []
-            for network in wifi.radio.start_scanning_networks():
-                if network.ssid == self.ssid:
-                    networks.append(
-                        {
-                            "ssid": network.ssid,
-                            "rssi": network.rssi,
-                            "channel": network.channel,
-                            "bssid": ":".join(["%02X" % b for b in network.bssid]),
-                        }
-                    )
-            wifi.radio.stop_scanning_networks()
-
-            if networks:
-                # Sort by RSSI (strongest first)
-                networks.sort(key=lambda x: x["rssi"], reverse=True)
-                self._scan_results = networks
-                print(f"{self.get_timestamp()} Found {len(networks)} access points:")
-                for ap in networks[:3]:  # Only print top 3
-                    print(f"  Ch{ap['channel']:2d} RSSI:{ap['rssi']:3d} {ap['bssid']}")
-
-                # Note: We cannot control which AP we connect to
-                # CircuitPython will choose one arbitrarily
-                self.state = self.CONNECTING
-                self._connect_timer = time.monotonic()
-            else:
-                print(f"{self.get_timestamp()} No networks found, retrying...")
-
-        except Exception as e:
-            print(f"{self.get_timestamp()} Scan error: {e}")
-            # Try direct connect without scan
-            self.state = self.CONNECTING
-            self._connect_timer = time.monotonic()
-
-    def _handle_connection(self):
-        """Handle connection attempts"""
-        if not wifi.radio.connected:
-            if time.monotonic() - self._connect_timer > WiFiConfig.CONNECT_TIMEOUT:
-                print(f"{self.get_timestamp()} Connection timeout")
-                self.state = self.DISCONNECTED
-                self._disconnect_time = time.monotonic()  # Track when we disconnected
-            else:
-                # Try to connect
-                try:
-                    print(f"{self.get_timestamp()} Connecting to {self.ssid}...")
-                    # Note: CircuitPython will choose which AP to connect to
-                    # We cannot control the selection even with BSSID parameter
-                    wifi.radio.connect(self.ssid, self.password)
-                except Exception as e:
-                    if "Already connected" not in str(e):
-                        print(f"{self.get_timestamp()} Connect error: {e}")
-        else:
-            # Connected!
-            self.state = self.CONNECTED
-            self.connected_at = time.monotonic()
-            self.current_rssi = wifi.radio.ap_info.rssi if wifi.radio.ap_info else 0
-            self.current_channel = (
-                wifi.radio.ap_info.channel if wifi.radio.ap_info else 0
-            )
-
-            # Log which AP we actually connected to
-            if wifi.radio.ap_info:
-                actual_bssid = ":".join(["%02X" % b for b in wifi.radio.ap_info.bssid])
-                print(
-                    f"{self.get_timestamp()} Connected to {actual_bssid}! RSSI: {self.current_rssi} Ch: {self.current_channel}"
-                )
-            else:
-                print(
-                    f"{self.get_timestamp()} Connected! RSSI: {self.current_rssi} Ch: {self.current_channel}"
-                )
-            print(f"{self.get_timestamp()} IP: {wifi.radio.ipv4_address}")
-
-    def _monitor_connection(self):
-        """Monitor existing connection"""
-        # Check if still connected
-        if not wifi.radio.connected:
-            print(f"{self.get_timestamp()} Connection lost")
-            self.state = self.DISCONNECTED
-            self.connected_at = None
-            self._disconnect_time = time.monotonic()
-            self._low_rssi_start = None  # Reset low RSSI tracking
-            self._rssi_was_good = True  # Reset RSSI state
-            self._in_connected_state = False  # Clear connection flag
-            return
-
-        # Update RSSI periodically
-        now = time.monotonic()
-        if wifi.radio.ap_info and self.can_measure():
-            self.current_rssi = wifi.radio.ap_info.rssi
-
-            # Check if signal too weak - with spam prevention and reconnection
-            if self.current_rssi < self.rssi_threshold:
-                # Only print on transition or every 5 seconds
-                if self._rssi_was_good:  # Just went bad
-                    print(
-                        f"{self.get_timestamp()} WARNING: RSSI below threshold: {self.current_rssi}"
-                    )
-                    self._last_rssi_warning = now
-                    self._rssi_was_good = False
-                    self._low_rssi_start = now  # Track when low RSSI started
-                elif now - self._last_rssi_warning > 5:  # Periodic warning
-                    print(
-                        f"{self.get_timestamp()} WARNING: RSSI still low: {self.current_rssi}"
-                    )
-                    self._last_rssi_warning = now
-
-                    # Check if we've been in low RSSI state for too long
-                    if (
-                        self._low_rssi_start
-                        and (now - self._low_rssi_start)
-                        > WiFiConfig.LOW_RSSI_DISCONNECT_TIME
-                    ):
-                        print(
-                            f"{self.get_timestamp()} RSSI too low for too long, disconnecting to rescan"
-                        )
-                        # Force disconnect to trigger rescan
-                        try:
-                            wifi.radio.disconnect()
-                        except:
-                            pass
-                        self.state = self.DISCONNECTED
-                        self.connected_at = None
-                        self._disconnect_time = time.monotonic()
-                        self._low_rssi_start = None  # Reset low RSSI tracking
-                        self._rssi_was_good = True  # Reset RSSI state
-                        self._in_connected_state = False  # Clear connection flag
-                        return
-            else:
-                self._rssi_was_good = True  # Signal recovered
-                self._low_rssi_start = None  # Clear the low RSSI timer
-
-    def get_timestamp(self):
-        """Always returns useful time string"""
-        elapsed = int(time.monotonic() - self.monotonic_start)
-        total = self.base_seconds + elapsed
-        h = (total // 3600) % 24
-        m = (total % 3600) // 60
-        s = total % 60
-        return f"{h:02d}:{m:02d}:{s:02d}"
-
-    def is_available(self):
-        """Check if WiFi is connected and stable"""
-        return self.state == self.CONNECTED and self.current_rssi > self.rssi_threshold
-
-    def get_status(self):
-        """Get current status dict"""
-        uptime = None
-        if self.connected_at:
-            uptime = int(time.monotonic() - self.connected_at)
-
-        watchdog_remaining = None
-        if self.disconnected_since:
-            elapsed = time.monotonic() - self.disconnected_since
-            watchdog_remaining = max(0, self.watchdog_timeout - elapsed)
-
-        return {
-            "state": self.state,
-            "rssi": self.current_rssi,
-            "channel": self.current_channel,
-            "ssid": self.ssid if self.state == self.CONNECTED else None,
-            "connected": wifi.radio.connected,
-            "uptime": uptime,
-            "free_memory": gc.mem_free(),
-            "retry_count": self.retry_count,
-            "watchdog_remaining": watchdog_remaining,
-        }
-
-    def will_be_unavailable(self):
-        if self._low_rssi_start:
-            elapsed = time.monotonic() - self._low_rssi_start
-            if elapsed > WiFiConfig.LOW_RSSI_DISCONNECT_TIME:
-                return True
-        return self.state != self.CONNECTED
-
-    def can_measure(self):
-        """Check if safe to measure RSSI (respects MQTT busy flag)"""
-        return not self.busy_flag and self.state == self.CONNECTED
+    print("✓ Basic sync test passed")
 
 
-# Test code
-def main():
-    """Test WiFi Manager standalone"""
-    import os
-    from watchdog import WatchDogMode
+def test_sync_timeout():
+    """Test sync timeout handling"""
+    print("\n=== TEST 2: Sync Timeout ===")
 
-    ssid = os.getenv("WIFI_SSID", "TestNetwork")
-    password = os.getenv("WIFI_PASSWORD", "testpass")
+    # Modify the module temporarily to not auto-succeed
+    class NTPSyncTimeout(NTPSync):
+        def tick(self):
+            # Clear just_synced flag after one tick
+            if self.just_synced:
+                self.just_synced = False
 
-    print(f"Starting WiFi Manager test with SSID: {ssid}")
+            now = time.monotonic()
 
-    wifi_mgr = WiFiManager(ssid, password, start_time="12:00:00")
+            if self.state == self.UNSYNCED:
+                if self._should_attempt_sync(now):
+                    print(f"Starting sync attempt #{self._retry_count + 1}")
+                    self.state = self.SYNCING
+                    self._sync_start_time = now
+                    self._last_sync_attempt = now
+                    self._retry_count += 1
 
-    last_status = time.monotonic()
+            elif self.state == self.SYNCING:
+                # Always timeout, never succeed
+                if now - self._sync_start_time > 5.0:  # Use actual timeout
+                    print(f"Sync timeout after 5.0s")
+                    self._handle_sync_failure()
 
-    # Set up watchdog - CircuitPython uses WatchDogMode
-    wdt = microcontroller.watchdog
-    wdt.timeout = 5
-    wdt.mode = WatchDogMode.RESET
-    wdt.feed()
+    ntp = NTPSyncTimeout()
 
-    while True:
-        wifi_mgr.tick()
+    # Start sync
+    ntp.tick()
+    assert ntp.state == NTPSync.SYNCING
 
-        # Feed watchdog
-        wdt.feed()
+    # Wait for timeout
+    print("Waiting for timeout...")
+    start = time.monotonic()
+    while time.monotonic() - start < 6:
+        ntp.tick()
+        time.sleep(0.05)
 
-        # Status every 5 seconds
-        if time.monotonic() - last_status > 5:
-            status = wifi_mgr.get_status()
-            print(f"{wifi_mgr.get_timestamp()} Status: {status}")
+    # Should be back to UNSYNCED with retry delay
+    assert ntp.state == NTPSync.UNSYNCED
+    assert ntp._retry_delay == 30  # Initial retry delay
 
-            last_status = time.monotonic()
+    print("✓ Timeout test passed")
 
-        time.sleep(WiFiConfig.TICK_INTERVAL)
+
+def test_retry_backoff():
+    """Test exponential backoff on failures"""
+    print("\n=== TEST 3: Retry Backoff ===")
+
+    # Use the timeout version from previous test
+    class NTPSyncTimeout(NTPSync):
+        def tick(self):
+            if self.just_synced:
+                self.just_synced = False
+
+            now = time.monotonic()
+
+            if self.state == self.UNSYNCED:
+                if self._should_attempt_sync(now):
+                    print(f"Retry #{self._retry_count + 1} at {now:.1f}s")
+                    self.state = self.SYNCING
+                    self._sync_start_time = now
+                    self._last_sync_attempt = now
+                    self._retry_count += 1
+
+            elif self.state == self.SYNCING:
+                # Fail immediately for faster testing
+                if now - self._sync_start_time > 0.1:
+                    self._handle_sync_failure()
+
+    ntp = NTPSyncTimeout()
+
+    # Track retry delays
+    expected_delays = [30, 60, 120, 240, 300, 300]  # Capped at 300
+
+    for i, expected in enumerate(expected_delays[:4]):  # Test first 4
+        # Wait for sync attempt
+        while ntp.state != NTPSync.SYNCING:
+            ntp.tick()
+            time.sleep(0.01)
+
+        # Wait for failure
+        while ntp.state != NTPSync.UNSYNCED:
+            ntp.tick()
+            time.sleep(0.01)
+
+        print(f"After failure {i+1}: retry_delay = {ntp._retry_delay}s")
+        assert ntp._retry_delay == expected_delays[i]
+
+    print("✓ Retry backoff test passed")
+
+
+def test_periodic_resync():
+    """Test periodic resync after successful sync"""
+    print("\n=== TEST 4: Periodic Resync ===")
+
+    # Create version with very short resync interval
+    class NTPSyncShortInterval(NTPSync):
+        def tick(self):
+            if self.just_synced:
+                self.just_synced = False
+
+            now = time.monotonic()
+
+            if self.state == self.UNSYNCED:
+                if self._should_attempt_sync(now):
+                    self.state = self.SYNCING
+                    self._sync_start_time = now
+                    self._last_sync_attempt = now
+                    self._retry_count += 1
+
+            elif self.state == self.SYNCING:
+                # Succeed quickly
+                if now - self._sync_start_time > 0.1:
+                    self._handle_sync_success(time.time())
+
+            elif self.state == self.SYNCED:
+                # Check for resync with short interval (2 seconds for testing)
+                if now - self._last_successful_sync > 2.0:
+                    print(f"Time for periodic resync")
+                    self.state = self.UNSYNCED
+
+    ntp = NTPSyncShortInterval()
+
+    # Get initial sync
+    while not ntp.is_synced():
+        ntp.tick()
+        time.sleep(0.01)
+
+    print("Initial sync complete")
+    sync_count = ntp._sync_count
+
+    # Wait for periodic resync
+    print("Waiting for periodic resync...")
+    start = time.monotonic()
+    while time.monotonic() - start < 3:
+        ntp.tick()
+        if ntp._sync_count > sync_count:
+            print(f"Resync completed! Total syncs: {ntp._sync_count}")
+            break
+        time.sleep(0.05)
+
+    assert ntp._sync_count == 2
+    print("✓ Periodic resync test passed")
+
+
+def test_status_and_memory():
+    """Test status reporting and memory usage"""
+    print("\n=== TEST 5: Status and Memory ===")
+
+    initial_free = gc.mem_free()
+    print(f"Initial free memory: {initial_free} bytes")
+
+    ntp = NTPSync()
+
+    after_init = gc.mem_free()
+    print(f"After NTP init: {after_init} bytes")
+    print(f"NTP module used: {initial_free - after_init} bytes")
+
+    # Get status in different states
+    print("\nUNSYNCED status:")
+    status = ntp.get_status()
+    for k, v in status.items():
+        print(f"  {k}: {v}")
+
+    # Start sync
+    ntp.tick()
+    print("\nSYNCING status:")
+    status = ntp.get_status()
+    for k, v in status.items():
+        print(f"  {k}: {v}")
+
+    # Complete sync
+    start = time.monotonic()
+    while time.monotonic() - start < 1.5:
+        ntp.tick()
+        if ntp.is_synced():
+            break
+        time.sleep(0.05)
+
+    print("\nSYNCED status:")
+    status = ntp.get_status()
+    for k, v in status.items():
+        print(f"  {k}: {v}")
+
+    # Memory should be under 2KB
+    assert (initial_free - after_init) < 2048
+    print(f"\n✓ Memory usage under 2KB limit")
+
+
+def run_all_tests():
+    """Run all tests"""
+    print("=== NTP Basic Structure Tests ===")
+    print(f"Free memory at start: {gc.mem_free()} bytes")
+
+    test_basic_sync()
+    gc.collect()
+
+    test_sync_timeout()
+    gc.collect()
+
+    test_retry_backoff()
+    gc.collect()
+
+    test_periodic_resync()
+    gc.collect()
+
+    test_status_and_memory()
+
+    print("\n=== All tests passed! ===")
+    print(f"Free memory at end: {gc.mem_free()} bytes")
 
 
 if __name__ == "__main__":
-    main()
+    run_all_tests()

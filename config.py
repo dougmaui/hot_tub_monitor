@@ -1,6 +1,6 @@
-# config.py - Configuration constants for WiFi Manager
+# config.py - Configuration constants for WiFi Manager and NTP Sync
 """
-Configuration file for WiFi Manager Module
+Configuration file for Network Services Modules
 Centralizes all tunable parameters
 """
 
@@ -27,3 +27,21 @@ class WiFiConfig:
     # Connection quality thresholds
     LOW_RSSI_DISCONNECT_TIME = 10  # Seconds of low RSSI before disconnect
     LOW_RSSI_WARNING_TIME = 8  # Seconds before disconnect to warn MQTT
+
+
+class NTPConfig:
+    """NTP Sync configuration constants"""
+
+    # NTP Server
+    NTP_SERVER = "pool.ntp.org"  # Default NTP server
+    NTP_PORT = 123  # Standard NTP port
+
+    # Timing constants (seconds)
+    SYNC_INTERVAL = 3600  # How often to sync when stable (1 hour)
+    SYNC_TIMEOUT = 5.0  # Maximum time for sync attempt
+    INITIAL_RETRY_DELAY = 30  # First retry after failure (30 seconds)
+    MAX_RETRY_DELAY = 300  # Maximum retry delay (5 minutes)
+
+    # NTP Protocol
+    NTP_EPOCH_OFFSET = 2208988800  # Seconds between 1900 and 1970
+    NTP_PACKET_SIZE = 48  # Standard NTP packet size
