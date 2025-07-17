@@ -318,6 +318,8 @@ class WiFiManager:
                         # Force disconnect to trigger rescan
                         try:
                             wifi.radio.disconnect()
+                            wifi.radio.stop_scanning_networks()
+                            time.sleep(0.5)  # Give it time to fully clear
                         except:
                             pass
                         self.state = self.DISCONNECTED
@@ -339,6 +341,42 @@ class WiFiManager:
         m = (total % 3600) // 60
         s = total % 60
         return f"{h:02d}:{m:02d}:{s:02d}"
+
+    def set_time_offset_us(self, real_timestamp_us):
+        """Update time offset when NTP syncs (microseconds)"""
+        from config import get_local_offset, is_dst
+
+        # Convert to seconds for timezone calculation
+        real_timestamp = real_timestamp_us / 1000000
+
+        # Get local offset
+        local_offset = get_local_offset(real_timestamp)
+
+        # Apply timezone offset (in microseconds)
+        local_timestamp_us = real_timestamp_us + (local_offset * 1000000)
+
+        # Convert to seconds since midnight LOCAL time
+        local_seconds = local_timestamp_us // 1000000
+        seconds_since_midnight_local = int(local_seconds) % 86400
+
+        # Calculate time components
+        h = seconds_since_midnight_local // 3600
+        m = (seconds_since_midnight_local % 3600) // 60
+        s = seconds_since_midnight_local % 60
+        ms = (local_timestamp_us % 1000000) // 1000
+
+        print(f"DEBUG WiFi: Time is {h:02d}:{m:02d}:{s:02d}.{ms:03d}")
+
+        # Update base_seconds
+        current_monotonic = time.monotonic()
+        elapsed_since_start = int(current_monotonic - self.monotonic_start)
+        self.base_seconds = seconds_since_midnight_local - elapsed_since_start
+
+        # Show timezone
+        tz_name = "CEST" if is_dst(real_timestamp) else "CET"
+        print(
+            f"{self.get_timestamp()} WiFi: Time offset updated from NTP sync ({tz_name})"
+        )
 
     def is_available(self):
         """Check if WiFi is connected and stable"""

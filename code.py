@@ -1,266 +1,120 @@
-# test_ntp_basic.py - Test script for NTP module basic structure
+# code.py - Minimal Executive Module
 """
-Test the NTP module's state machine, retry logic, and coordination
-without actual NTP protocol implementation
+Executive loop for ESP32-S3 Network Services
+Coordinates WiFi Manager, NTP Sync, and MQTT Publisher
 """
 
 import time
 import gc
+import os
+from config import WiFiConfig
+from wifi_manager import WiFiManager
 from ntp_sync import NTPSync
 
 
-def test_basic_sync():
-    """Test basic sync operation"""
-    print("\n=== TEST 1: Basic Sync Operation ===")
+def test_float_math():
+    """Test basic float operations"""
+    big_int = 1752752692
+    small_float = 0.030818746
+
+    print(f"Test 1: {big_int} + {small_float} = {big_int + small_float}")
+    print(f"Test 2: float({big_int}) + {small_float} = {float(big_int) + small_float}")
+    print(f"Test 3: {big_int} + float({small_float}) = {big_int + float(small_float)}")
+
+    # Test with explicit float conversion
+    result = float(big_int) + small_float
+    print(f"Test 4: result = {result}")
+    print(f"Test 5: result type = {type(result)}")
+    print(f"Test 6: formatted = {result:.11f}")
+
+
+def main():
+    """Main executive loop"""
+    print("Starting Network Services Executive...")
+    print(f"  Free memory: {gc.mem_free()} bytes")
+
+    # Add this test before starting
+    print("\n=== Testing float arithmetic ===")
+    test_float_math()
+    print("=== End float test ===\n")
+
+    # Continue with rest of main...
+
+
+# Get credentials from environment
+WIFI_SSID = os.getenv("WIFI_SSID", "TestNetwork")
+WIFI_PASSWORD = os.getenv("WIFI_PASSWORD", "testpass")
+
+# Configuration
+TICK_INTERVAL = 0.05  # 50ms main loop
+HEALTH_CHECK_INTERVAL = 60  # Check system health every minute
+
+
+def main():
+    """Main executive loop"""
+    print("Starting Network Services Executive...")
+    print(f"  Free memory: {gc.mem_free()} bytes")
+
+    # Initialize modules
+    wifi = WiFiManager(WIFI_SSID, WIFI_PASSWORD, start_time="12:00:00")
+
+    # TODO: Add these as you build them
     ntp = NTPSync()
+    # mqtt = MQTTPublisher("broker.io", 1883, "esp32_client")
 
-    # Should start in UNSYNCED state
-    print(f"Initial state: {ntp.state}")
-    assert ntp.state == NTPSync.UNSYNCED
-    assert not ntp.is_synced()
-    assert ntp.get_time_quality() == "manual"
+    # Health monitoring
+    last_health_check = time.monotonic()
 
-    # First tick should start sync immediately
-    ntp.tick()
-    print(f"After first tick: {ntp.state}")
-    assert ntp.state == NTPSync.SYNCING
+    print("Executive loop started")
 
-    # Wait for simulated sync to complete (1 second)
-    start = time.monotonic()
-    while time.monotonic() - start < 1.5:
-        ntp.tick()
-        if ntp.just_synced:
-            print(f"Sync completed! State: {ntp.state}")
-            print(f"Time quality: {ntp.get_time_quality()}")
-            print(f"Real timestamp: {ntp.get_real_timestamp()}")
-            break
-        time.sleep(0.05)
+    while True:
+        # Always tick WiFi
+        wifi.tick()
 
-    assert ntp.state == NTPSync.SYNCED
-    assert ntp.is_synced()
-    assert ntp.get_time_quality() == "ntp"
-
-    # Check that just_synced flag clears
-    ntp.tick()
-    assert not ntp.just_synced
-
-    print("✓ Basic sync test passed")
-
-
-def test_sync_timeout():
-    """Test sync timeout handling"""
-    print("\n=== TEST 2: Sync Timeout ===")
-
-    # Modify the module temporarily to not auto-succeed
-    class NTPSyncTimeout(NTPSync):
-        def tick(self):
-            # Clear just_synced flag after one tick
-            if self.just_synced:
-                self.just_synced = False
-
-            now = time.monotonic()
-
-            if self.state == self.UNSYNCED:
-                if self._should_attempt_sync(now):
-                    print(f"Starting sync attempt #{self._retry_count + 1}")
-                    self.state = self.SYNCING
-                    self._sync_start_time = now
-                    self._last_sync_attempt = now
-                    self._retry_count += 1
-
-            elif self.state == self.SYNCING:
-                # Always timeout, never succeed
-                if now - self._sync_start_time > 5.0:  # Use actual timeout
-                    print(f"Sync timeout after 5.0s")
-                    self._handle_sync_failure()
-
-    ntp = NTPSyncTimeout()
-
-    # Start sync
-    ntp.tick()
-    assert ntp.state == NTPSync.SYNCING
-
-    # Wait for timeout
-    print("Waiting for timeout...")
-    start = time.monotonic()
-    while time.monotonic() - start < 6:
-        ntp.tick()
-        time.sleep(0.05)
-
-    # Should be back to UNSYNCED with retry delay
-    assert ntp.state == NTPSync.UNSYNCED
-    assert ntp._retry_delay == 30  # Initial retry delay
-
-    print("✓ Timeout test passed")
-
-
-def test_retry_backoff():
-    """Test exponential backoff on failures"""
-    print("\n=== TEST 3: Retry Backoff ===")
-
-    # Use the timeout version from previous test
-    class NTPSyncTimeout(NTPSync):
-        def tick(self):
-            if self.just_synced:
-                self.just_synced = False
-
-            now = time.monotonic()
-
-            if self.state == self.UNSYNCED:
-                if self._should_attempt_sync(now):
-                    print(f"Retry #{self._retry_count + 1} at {now:.1f}s")
-                    self.state = self.SYNCING
-                    self._sync_start_time = now
-                    self._last_sync_attempt = now
-                    self._retry_count += 1
-
-            elif self.state == self.SYNCING:
-                # Fail immediately for faster testing
-                if now - self._sync_start_time > 0.1:
-                    self._handle_sync_failure()
-
-    ntp = NTPSyncTimeout()
-
-    # Track retry delays
-    expected_delays = [30, 60, 120, 240, 300, 300]  # Capped at 300
-
-    for i, expected in enumerate(expected_delays[:4]):  # Test first 4
-        # Wait for sync attempt
-        while ntp.state != NTPSync.SYNCING:
+        # TODO: Add NTP when available
+        if wifi.is_available():
             ntp.tick()
-            time.sleep(0.01)
+            # In code.py, when NTP syncs:
+            if ntp.just_synced:
+                # Get timestamp in microseconds
+                timestamp_us = ntp.get_real_timestamp_us()
+                print(f"Executive: Passing timestamp {timestamp_us} µs to WiFi")
+                wifi.set_time_offset_us(timestamp_us)
 
-        # Wait for failure
-        while ntp.state != NTPSync.UNSYNCED:
-            ntp.tick()
-            time.sleep(0.01)
+        # TODO: Add MQTT when available
+        # if wifi.is_available() and not wifi.will_be_unavailable():
+        #     if not wifi.measuring:
+        #         mqtt.tick()
 
-        print(f"After failure {i+1}: retry_delay = {ntp._retry_delay}s")
-        assert ntp._retry_delay == expected_delays[i]
+        # Health monitoring
+        now = time.monotonic()
+        if now - last_health_check >= HEALTH_CHECK_INTERVAL:
+            free_mem = gc.mem_free()
+            status = wifi.get_status()
+            ntp_status = ntp.get_status()
 
-    print("✓ Retry backoff test passed")
+            # Single line health check
+            print(
+                f"{wifi.get_timestamp()} Health: WiFi {status['state']} RSSI:{status['rssi']} Ch:{status['channel']} | NTP:{ntp_status['quality']} | Mem:{free_mem}"
+            )
 
+            last_health_check = now
 
-def test_periodic_resync():
-    """Test periodic resync after successful sync"""
-    print("\n=== TEST 4: Periodic Resync ===")
+            # TODO: Add emergency actions
+            # if free_mem < 20000:
+            #     print("  WARNING: Low memory!")
+            #     if mqtt:
+            #         mqtt.emergency_flush()
 
-    # Create version with very short resync interval
-    class NTPSyncShortInterval(NTPSync):
-        def tick(self):
-            if self.just_synced:
-                self.just_synced = False
+            last_health_check = now
 
-            now = time.monotonic()
-
-            if self.state == self.UNSYNCED:
-                if self._should_attempt_sync(now):
-                    self.state = self.SYNCING
-                    self._sync_start_time = now
-                    self._last_sync_attempt = now
-                    self._retry_count += 1
-
-            elif self.state == self.SYNCING:
-                # Succeed quickly
-                if now - self._sync_start_time > 0.1:
-                    self._handle_sync_success(time.time())
-
-            elif self.state == self.SYNCED:
-                # Check for resync with short interval (2 seconds for testing)
-                if now - self._last_successful_sync > 2.0:
-                    print(f"Time for periodic resync")
-                    self.state = self.UNSYNCED
-
-    ntp = NTPSyncShortInterval()
-
-    # Get initial sync
-    while not ntp.is_synced():
-        ntp.tick()
-        time.sleep(0.01)
-
-    print("Initial sync complete")
-    sync_count = ntp._sync_count
-
-    # Wait for periodic resync
-    print("Waiting for periodic resync...")
-    start = time.monotonic()
-    while time.monotonic() - start < 3:
-        ntp.tick()
-        if ntp._sync_count > sync_count:
-            print(f"Resync completed! Total syncs: {ntp._sync_count}")
-            break
-        time.sleep(0.05)
-
-    assert ntp._sync_count == 2
-    print("✓ Periodic resync test passed")
+        # Maintain loop timing
+        time.sleep(TICK_INTERVAL)
 
 
-def test_status_and_memory():
-    """Test status reporting and memory usage"""
-    print("\n=== TEST 5: Status and Memory ===")
-
-    initial_free = gc.mem_free()
-    print(f"Initial free memory: {initial_free} bytes")
-
-    ntp = NTPSync()
-
-    after_init = gc.mem_free()
-    print(f"After NTP init: {after_init} bytes")
-    print(f"NTP module used: {initial_free - after_init} bytes")
-
-    # Get status in different states
-    print("\nUNSYNCED status:")
-    status = ntp.get_status()
-    for k, v in status.items():
-        print(f"  {k}: {v}")
-
-    # Start sync
-    ntp.tick()
-    print("\nSYNCING status:")
-    status = ntp.get_status()
-    for k, v in status.items():
-        print(f"  {k}: {v}")
-
-    # Complete sync
-    start = time.monotonic()
-    while time.monotonic() - start < 1.5:
-        ntp.tick()
-        if ntp.is_synced():
-            break
-        time.sleep(0.05)
-
-    print("\nSYNCED status:")
-    status = ntp.get_status()
-    for k, v in status.items():
-        print(f"  {k}: {v}")
-
-    # Memory should be under 2KB
-    assert (initial_free - after_init) < 2048
-    print(f"\n✓ Memory usage under 2KB limit")
-
-
-def run_all_tests():
-    """Run all tests"""
-    print("=== NTP Basic Structure Tests ===")
-    print(f"Free memory at start: {gc.mem_free()} bytes")
-
-    test_basic_sync()
-    gc.collect()
-
-    test_sync_timeout()
-    gc.collect()
-
-    test_retry_backoff()
-    gc.collect()
-
-    test_periodic_resync()
-    gc.collect()
-
-    test_status_and_memory()
-
-    print("\n=== All tests passed! ===")
-    print(f"Free memory at end: {gc.mem_free()} bytes")
-
-
+# Then modify the very bottom of code.py:
 if __name__ == "__main__":
-    run_all_tests()
+    print("\n=== Testing float arithmetic ===")
+    test_float_math()
+    print("=== End float test ===\n")
+    main()

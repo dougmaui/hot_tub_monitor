@@ -35,6 +35,9 @@ class NTPConfig:
     # NTP Server
     NTP_SERVER = "pool.ntp.org"  # Default NTP server
     NTP_PORT = 123  # Standard NTP port
+    TIMEZONE_OFFSET = 1  # PST is UTC-8
+    USE_DST = True  # Enable Daylight Saving Time calculation
+    DST_OFFSET = 1  # DST adds 1 hour
 
     # Timing constants (seconds)
     SYNC_INTERVAL = 3600  # How often to sync when stable (1 hour)
@@ -45,3 +48,24 @@ class NTPConfig:
     # NTP Protocol
     NTP_EPOCH_OFFSET = 2208988800  # Seconds between 1900 and 1970
     NTP_PACKET_SIZE = 48  # Standard NTP packet size
+
+
+def is_dst(timestamp):
+    """Simple DST check for US - DST is approximately April through October"""
+    if not NTPConfig.USE_DST:
+        return False
+
+    try:
+        days_since_epoch = int(timestamp // 86400)
+        month = ((days_since_epoch % 365) // 30) + 1
+        return 4 <= month <= 10
+    except:
+        return False
+
+
+def get_local_offset(timestamp):
+    """Get the local time offset from UTC in seconds"""
+    base_offset = NTPConfig.TIMEZONE_OFFSET * 3600
+    if is_dst(timestamp):
+        return base_offset + (NTPConfig.DST_OFFSET * 3600)
+    return base_offset
