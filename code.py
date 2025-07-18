@@ -11,36 +11,6 @@ from config import WiFiConfig
 from wifi_manager import WiFiManager
 from ntp_sync import NTPSync
 
-
-def test_float_math():
-    """Test basic float operations"""
-    big_int = 1752752692
-    small_float = 0.030818746
-
-    print(f"Test 1: {big_int} + {small_float} = {big_int + small_float}")
-    print(f"Test 2: float({big_int}) + {small_float} = {float(big_int) + small_float}")
-    print(f"Test 3: {big_int} + float({small_float}) = {big_int + float(small_float)}")
-
-    # Test with explicit float conversion
-    result = float(big_int) + small_float
-    print(f"Test 4: result = {result}")
-    print(f"Test 5: result type = {type(result)}")
-    print(f"Test 6: formatted = {result:.11f}")
-
-
-def main():
-    """Main executive loop"""
-    print("Starting Network Services Executive...")
-    print(f"  Free memory: {gc.mem_free()} bytes")
-
-    # Add this test before starting
-    print("\n=== Testing float arithmetic ===")
-    test_float_math()
-    print("=== End float test ===\n")
-
-    # Continue with rest of main...
-
-
 # Get credentials from environment
 WIFI_SSID = os.getenv("WIFI_SSID", "TestNetwork")
 WIFI_PASSWORD = os.getenv("WIFI_PASSWORD", "testpass")
@@ -57,9 +27,8 @@ def main():
 
     # Initialize modules
     wifi = WiFiManager(WIFI_SSID, WIFI_PASSWORD, start_time="12:00:00")
-
-    # TODO: Add these as you build them
     ntp = NTPSync()
+    # TODO: Add MQTT when available
     # mqtt = MQTTPublisher("broker.io", 1883, "esp32_client")
 
     # Health monitoring
@@ -71,10 +40,11 @@ def main():
         # Always tick WiFi
         wifi.tick()
 
-        # TODO: Add NTP when available
+        # Tick NTP if WiFi available
         if wifi.is_available():
             ntp.tick()
-            # In code.py, when NTP syncs:
+
+            # Handle NTP sync
             if ntp.just_synced:
                 # Get timestamp in microseconds
                 timestamp_us = ntp.get_real_timestamp_us()
@@ -94,9 +64,14 @@ def main():
             ntp_status = ntp.get_status()
 
             # Single line health check
-            print(
-                f"{wifi.get_timestamp()} Health: WiFi {status['state']} RSSI:{status['rssi']} Ch:{status['channel']} | NTP:{ntp_status['quality']} | Mem:{free_mem}"
-            )
+            ts = wifi.get_timestamp()
+            state = status['state']
+            rssi = status['rssi']
+            ch = status['channel']
+            bssid = wifi.current_bssid or 'None'
+            ntp_qual = ntp_status['quality']
+            mem = free_mem
+            print(f"{ts} Health: WiFi {state} RSSI:{rssi} Ch:{ch} BSSID:{bssid} | NTP:{ntp_qual} | Mem:{mem}")
 
             last_health_check = now
 
@@ -112,9 +87,5 @@ def main():
         time.sleep(TICK_INTERVAL)
 
 
-# Then modify the very bottom of code.py:
 if __name__ == "__main__":
-    print("\n=== Testing float arithmetic ===")
-    test_float_math()
-    print("=== End float test ===\n")
     main()

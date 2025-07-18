@@ -28,6 +28,11 @@ class WiFiConfig:
     LOW_RSSI_DISCONNECT_TIME = 10  # Seconds of low RSSI before disconnect
     LOW_RSSI_WARNING_TIME = 8  # Seconds before disconnect to warn MQTT
 
+    # Better AP switching parameters
+    BETTER_AP_MARGIN = 10  # dB improvement needed to consider switching
+    BETTER_AP_CHECK_INTERVAL = 45  # Check for better APs every minute
+    BETTER_AP_STABLE_TIME = 30  # Seconds better AP must remain stable before switching
+
 
 class NTPConfig:
     """NTP Sync configuration constants"""

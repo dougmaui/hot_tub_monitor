@@ -42,6 +42,7 @@ class WiFiManager:
         self._scan_timer = 0
         self._connect_timer = 0
         self._scan_results = []
+        self._target_ap = None
 
         # Time management
         self.monotonic_start = time.monotonic()
@@ -72,6 +73,12 @@ class WiFiManager:
         self._rssi_was_good = True
         self._low_rssi_start = None
         self._in_connected_state = False
+
+        # Better AP detection
+        self._last_better_ap_check = 0
+        self._better_ap_found_time = None
+        self._better_ap_bssid = None
+        self._better_ap_rssi = None
 
         # Watchdog tracking
         self.watchdog_timeout = (
@@ -144,10 +151,13 @@ class WiFiManager:
                 self.retry_count = 0
 
             # Reset RSSI tracking on fresh connection
-            if not hasattr(self, "_in_connected_state"):
+            if not self._in_connected_state:
                 self._low_rssi_start = None
                 self._rssi_was_good = True
                 self._in_connected_state = True
+                # Initialize better AP check timer to current time
+                self._last_better_ap_check = now
+
             self._monitor_connection()
 
         elif self.state == self.DISCONNECTED:
@@ -186,10 +196,6 @@ class WiFiManager:
                 # Clear scan results
                 self._scan_results = []
 
-                # Reduce history if needed
-                if self.history_count > 30:
-                    self.history_count = 30
-
         else:
             self._low_memory_mode = False
 
@@ -203,12 +209,14 @@ class WiFiManager:
             networks = []
             for network in wifi.radio.start_scanning_networks():
                 if network.ssid == self.ssid:
+                    # Store raw bssid bytes for connection
                     networks.append(
                         {
                             "ssid": network.ssid,
                             "rssi": network.rssi,
                             "channel": network.channel,
-                            "bssid": ":".join(["%02X" % b for b in network.bssid]),
+                            "bssid": network.bssid,  # Keep raw bytes
+                            "bssid_str": ":".join(["%02X" % b for b in network.bssid]),
                         }
                     )
             wifi.radio.stop_scanning_networks()
@@ -219,10 +227,16 @@ class WiFiManager:
                 self._scan_results = networks
                 print(f"{self.get_timestamp()} Found {len(networks)} access points:")
                 for ap in networks[:3]:  # Only print top 3
-                    print(f"  Ch{ap['channel']:2d} RSSI:{ap['rssi']:3d} {ap['bssid']}")
+                    print(
+                        f"  Ch{ap['channel']:2d} RSSI:{ap['rssi']:3d} {ap['bssid_str']}"
+                    )
 
-                # Note: We cannot control which AP we connect to
-                # CircuitPython will choose one arbitrarily
+                # Store the target AP we want to connect to
+                self._target_ap = networks[0]  # Strongest
+                print(
+                    f"{self.get_timestamp()} Target AP: {self._target_ap['bssid_str']} (RSSI: {self._target_ap['rssi']})"
+                )
+
                 self.state = self.CONNECTING
                 self._connect_timer = time.monotonic()
             else:
@@ -233,6 +247,7 @@ class WiFiManager:
             # Try direct connect without scan
             self.state = self.CONNECTING
             self._connect_timer = time.monotonic()
+            self._target_ap = None
 
     def _handle_connection(self):
         """Handle connection attempts"""
@@ -244,10 +259,21 @@ class WiFiManager:
             else:
                 # Try to connect
                 try:
-                    print(f"{self.get_timestamp()} Connecting to {self.ssid}...")
-                    # Note: CircuitPython will choose which AP to connect to
-                    # We cannot control the selection even with BSSID parameter
-                    wifi.radio.connect(self.ssid, self.password)
+                    if self._target_ap:
+                        # Connect to specific AP using BSSID
+                        print(
+                            f"{self.get_timestamp()} Connecting to {self.ssid} at {self._target_ap['bssid_str']}..."
+                        )
+                        wifi.radio.connect(
+                            self.ssid,
+                            self.password,
+                            channel=self._target_ap["channel"],
+                            bssid=self._target_ap["bssid"],
+                        )
+                    else:
+                        # Fallback: connect without BSSID
+                        print(f"{self.get_timestamp()} Connecting to {self.ssid}...")
+                        wifi.radio.connect(self.ssid, self.password)
                 except Exception as e:
                     if "Already connected" not in str(e):
                         print(f"{self.get_timestamp()} Connect error: {e}")
@@ -263,9 +289,18 @@ class WiFiManager:
             # Log which AP we actually connected to
             if wifi.radio.ap_info:
                 actual_bssid = ":".join(["%02X" % b for b in wifi.radio.ap_info.bssid])
+                self.current_bssid = actual_bssid
                 print(
                     f"{self.get_timestamp()} Connected to {actual_bssid}! RSSI: {self.current_rssi} Ch: {self.current_channel}"
                 )
+
+                # Verify we got the AP we wanted
+                if self._target_ap and actual_bssid == self._target_ap["bssid_str"]:
+                    print(f"{self.get_timestamp()} ✓ Connected to requested AP")
+                elif self._target_ap:
+                    print(
+                        f"{self.get_timestamp()} ⚠ Connected to different AP than requested"
+                    )
             else:
                 print(
                     f"{self.get_timestamp()} Connected! RSSI: {self.current_rssi} Ch: {self.current_channel}"
@@ -285,8 +320,10 @@ class WiFiManager:
             self._in_connected_state = False  # Clear connection flag
             return
 
-        # Update RSSI periodically
+        # NOW we're connected, so define 'now' and do the monitoring
         now = time.monotonic()
+
+        # Update RSSI periodically
         if wifi.radio.ap_info and self.can_measure():
             self.current_rssi = wifi.radio.ap_info.rssi
 
@@ -313,25 +350,75 @@ class WiFiManager:
                         > WiFiConfig.LOW_RSSI_DISCONNECT_TIME
                     ):
                         print(
-                            f"{self.get_timestamp()} RSSI too low for too long, disconnecting to rescan"
+                            f"{self.get_timestamp()} RSSI too low for too long, checking for better APs..."
                         )
-                        # Force disconnect to trigger rescan
-                        try:
-                            wifi.radio.disconnect()
-                            wifi.radio.stop_scanning_networks()
-                            time.sleep(0.5)  # Give it time to fully clear
-                        except:
-                            pass
-                        self.state = self.DISCONNECTED
-                        self.connected_at = None
-                        self._disconnect_time = time.monotonic()
-                        self._low_rssi_start = None  # Reset low RSSI tracking
-                        self._rssi_was_good = True  # Reset RSSI state
-                        self._in_connected_state = False  # Clear connection flag
-                        return
+                        self._check_for_better_ap()
+                        # Reset the low RSSI timer since we just checked
+                        self._low_rssi_start = now
+
             else:
                 self._rssi_was_good = True  # Signal recovered
                 self._low_rssi_start = None  # Clear the low RSSI timer
+
+        # Periodically check for better APs even if signal is acceptable
+        if now - self._last_better_ap_check > WiFiConfig.BETTER_AP_CHECK_INTERVAL:
+            if self.current_rssi < WiFiConfig.RSSI_GOOD:  # Not excellent signal
+                self._check_for_better_ap()
+                self._last_better_ap_check = now
+
+    def _check_for_better_ap(self):
+        """Check if there's a significantly better AP available"""
+        print(f"{self.get_timestamp()} Scanning for better access points...")
+
+        try:
+            # Quick scan while connected
+            networks = []
+            for network in wifi.radio.start_scanning_networks():
+                if network.ssid == self.ssid:
+                    networks.append({
+                        "rssi": network.rssi,
+                        "bssid_str": ":".join(["%02X" % b for b in network.bssid]),
+                    })
+            wifi.radio.stop_scanning_networks()
+
+            if not networks:
+                return
+
+            # Find the best AP
+            best_ap = max(networks, key=lambda x: x["rssi"])
+
+            # Check if we found a significantly better AP
+            rssi_improvement = best_ap["rssi"] - self.current_rssi
+
+            if best_ap["bssid_str"] != self.current_bssid and rssi_improvement >= WiFiConfig.BETTER_AP_MARGIN:
+                now = time.monotonic()
+
+                # First time finding this better AP?
+                if self._better_ap_bssid != best_ap["bssid_str"]:
+                    self._better_ap_bssid = best_ap["bssid_str"]
+                    self._better_ap_rssi = best_ap["rssi"]
+                    self._better_ap_found_time = now
+                    print("{} Found better AP: {} (RSSI: {}, improvement: +{}dB)".format(
+                        self.get_timestamp(), best_ap['bssid_str'], best_ap['rssi'], rssi_improvement))
+                    print("{} Will switch if better AP remains stable for {}s".format(
+                        self.get_timestamp(), WiFiConfig.BETTER_AP_STABLE_TIME))
+
+                # Check if better AP has been stable long enough
+                elif now - self._better_ap_found_time >= WiFiConfig.BETTER_AP_STABLE_TIME:
+                    print(f"{self.get_timestamp()} Better AP stable, initiating switch...")
+                    print(f"{self.get_timestamp()} Current: {self.current_bssid} (RSSI: {self.current_rssi})")
+                    print(f"{self.get_timestamp()} Target:  {best_ap['bssid_str']} (RSSI: {best_ap['rssi']})")
+                    print(f"{self.get_timestamp()} Resetting to switch access points...")
+                    microcontroller.reset()
+            else:
+                # No better AP or improvement not significant enough
+                if self._better_ap_bssid:
+                    print(f"{self.get_timestamp()} Better AP no longer viable, continuing with current")
+                self._better_ap_bssid = None
+                self._better_ap_found_time = None
+
+        except Exception as e:
+            print(f"{self.get_timestamp()} Error checking for better AP: {e}")
 
     def get_timestamp(self):
         """Always returns useful time string"""
@@ -365,8 +452,6 @@ class WiFiManager:
         s = seconds_since_midnight_local % 60
         ms = (local_timestamp_us % 1000000) // 1000
 
-        print(f"DEBUG WiFi: Time is {h:02d}:{m:02d}:{s:02d}.{ms:03d}")
-
         # Update base_seconds
         current_monotonic = time.monotonic()
         elapsed_since_start = int(current_monotonic - self.monotonic_start)
@@ -380,8 +465,7 @@ class WiFiManager:
 
     def is_available(self):
         """Check if WiFi is connected and stable"""
-        return self.state == self.CONNECTED and self.current_rssi > self.rssi_threshold
-
+        return self.state == self.CONNECTED
     def get_status(self):
         """Get current status dict"""
         uptime = None

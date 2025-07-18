@@ -224,12 +224,6 @@ class NTPSync:
             packet = bytearray(NTPConfig.NTP_PACKET_SIZE)
             packet[0] = 0b00100011  # LI=0, Version=4, Mode=3 (client)
 
-            # DEBUG: Show what we're sending
-            print(f"DEBUG NTP: Sending NTP request packet")
-            print(
-                f"DEBUG NTP: First byte: {packet[0]:08b} (LI={packet[0]>>6}, Ver={(packet[0]>>3)&0x07}, Mode={packet[0]&0x07})"
-            )
-
             # Send packet
             self._socket.sendto(packet, (self.ntp_server, NTPConfig.NTP_PORT))
             self._send_time = time.monotonic()
@@ -273,8 +267,6 @@ class NTPSync:
                 adjusted_timestamp_us = unix_timestamp_us + network_delay_us
 
                 print(f"NTP: Response received, delay: {network_delay_us/1000:.1f}ms")
-                print(f"DEBUG NTP: Timestamp (µs): {adjusted_timestamp_us}")
-
                 return adjusted_timestamp_us  # Return microseconds
 
         except OSError:
