@@ -59,27 +59,53 @@ class MQTTConfig:
     # Connection
     BROKER = "io.adafruit.com"
     PORT = 1883  # Non-SSL for production (change to 8883 for SSL)
-    
+
     # Publishing rates
     PUBLISH_RATE_DEV = 20   # Development: 20/minute
     PUBLISH_RATE_PROD = 5   # Production: 5/minute
-    
+
     # Bucket size - for burst capacity
     MIN_BUCKET_SIZE = 20    # Minimum tokens for emergencies
-    
+
     # Queue settings
     MAX_QUEUE_SIZE = 20
-    
+
     # Publishing intervals
     HEALTH_PUBLISH_INTERVAL = 60  # Publish every 60 seconds
-    
+
     # Memory thresholds
     MIN_MEMORY_PUBLISH = 15000   # Don't publish below this
     MIN_MEMORY_WARNING = 15000   # Warning threshold
     MIN_MEMORY_CRITICAL = 10000  # Critical threshold
-    
+
     # Set to False to disable MQTT
     ENABLED = True
+
+
+class DisplayConfig:
+    # SPI pins (using ESP32-S3 defaults - as strings)
+    # These will be converted to actual pins in the display module
+    
+    # Display control pins (your connections)
+    CS_PIN = "D5"     # LCD_CS - Chip Select
+    DC_PIN = "D6"     # LCD_DC - Data/Command
+    RST_PIN = "D11"    # LCD_RST - Reset
+    BL_PIN = "D10"    # LCD_BL - Backlight control
+    
+    # Display settings
+    WIDTH = 320
+    HEIGHT = 480
+    ROTATION = 0  # Adjust if display is oriented wrong
+    BACKGROUND_COLOR = 0x000080  # Deep blue
+    TEXT_COLOR = 0xFFFFFF  # White
+    
+    # Update settings
+    UPDATE_INTERVAL = 1.0  # Minimum seconds between updates
+    MEMORY_LIMIT = 15000  # Maximum bytes for display
+    
+    # Failure management
+    SPI_TIMEOUT = 1.0  # Seconds before declaring SPI hung
+    ENABLE_DISPLAY = True  # Can be set False for headless operation
 
 
 def is_dst(timestamp):
