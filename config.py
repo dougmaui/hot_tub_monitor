@@ -18,7 +18,7 @@ class WiFiConfig:
     TICK_INTERVAL = 0.05  # Main loop interval
 
     # Memory management
-    MEMORY_WARNING = 50000  # Memory warning threshold (bytes)
+    MEMORY_WARNING = 10000 # Memory warning threshold (bytes)
 
     # Watchdog settings
     CONNECTION_WATCHDOG_TIMEOUT = 3600  # 1 hour default
@@ -53,6 +53,33 @@ class NTPConfig:
     # NTP Protocol
     NTP_EPOCH_OFFSET = 2208988800  # Seconds between 1900 and 1970
     NTP_PACKET_SIZE = 48  # Standard NTP packet size
+
+class MQTTConfig:
+    """MQTT Publisher configuration"""
+    # Connection
+    BROKER = "io.adafruit.com"
+    PORT = 1883  # Non-SSL for production (change to 8883 for SSL)
+    
+    # Publishing rates
+    PUBLISH_RATE_DEV = 20   # Development: 20/minute
+    PUBLISH_RATE_PROD = 5   # Production: 5/minute
+    
+    # Bucket size - for burst capacity
+    MIN_BUCKET_SIZE = 20    # Minimum tokens for emergencies
+    
+    # Queue settings
+    MAX_QUEUE_SIZE = 20
+    
+    # Publishing intervals
+    HEALTH_PUBLISH_INTERVAL = 60  # Publish every 60 seconds
+    
+    # Memory thresholds
+    MIN_MEMORY_PUBLISH = 15000   # Don't publish below this
+    MIN_MEMORY_WARNING = 15000   # Warning threshold
+    MIN_MEMORY_CRITICAL = 10000  # Critical threshold
+    
+    # Set to False to disable MQTT
+    ENABLED = True
 
 
 def is_dst(timestamp):
