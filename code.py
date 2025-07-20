@@ -1,16 +1,17 @@
-# code.py - Minimal Executive Module
+# code.py - Executive Module with Display
 """
 Executive loop for ESP32-S3 Network Services
-Coordinates WiFi Manager, NTP Sync, and MQTT Publisher
+Coordinates WiFi Manager, NTP Sync, MQTT Publisher, and Display
 """
 
 import time
 import gc
 import os
-from config import WiFiConfig, MQTTConfig
+from config import WiFiConfig, MQTTConfig, DisplayConfig
 from wifi_manager import WiFiManager
 from ntp_sync import NTPSync
 from mqtt_publisher import MQTTPublisher
+from display_module import DisplayModule
 
 # Get credentials from environment
 WIFI_SSID = os.getenv("WIFI_SSID", "TestNetwork")
@@ -31,6 +32,10 @@ def main():
     # Initialize modules
     wifi = WiFiManager(WIFI_SSID, WIFI_PASSWORD, start_time="12:00:00")
     ntp = NTPSync()
+    
+    # Initialize Display
+    display = DisplayModule()
+    print(f"  Display enabled: {display.enabled}")
 
    # Initialize MQTT if credentials available
     mqtt = None
@@ -57,6 +62,7 @@ def main():
     last_mqtt_publish = time.monotonic()   # Track MQTT publish timing
 
     print("Executive loop started")
+    print(f"  Free memory after init: {gc.mem_free()} bytes")
 
     while True:
         # Always tick WiFi
@@ -77,6 +83,9 @@ def main():
             if mqtt and not wifi.will_be_unavailable():
                 if not wifi.measuring:
                     mqtt.tick()
+
+        # Update display - pass all modules so it can read their status
+        display.tick(wifi, ntp, mqtt)
 
         # Health monitoring
         now = time.monotonic()
@@ -103,9 +112,14 @@ def main():
                 mqtt_state = mqtt_status['state']
                 mqtt_queue = mqtt_status['queue_size']
                 mqtt_sent = mqtt_status['messages_sent']
-                print(f" | MQTT:{mqtt_state} Q:{mqtt_queue} Sent:{mqtt_sent}")
+                print(f" | MQTT:{mqtt_state} Q:{mqtt_queue} Sent:{mqtt_sent}", end="")
+            
+            # Add display status
+            if display.enabled:
+                display_status = display.get_status()
+                print(f" | Display:ON Updates:{display_status['updates']}")
             else:
-                print()  # End the line if no MQTT
+                print(" | Display:OFF")
 
             # Emergency actions
             if free_mem < MQTTConfig.MIN_MEMORY_WARNING:
