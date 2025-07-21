@@ -1,19 +1,26 @@
+# Bytecode and Python cache
 *.pyc
 __pycache__/
+
+# IDE/project folders
 .vscode/
 .idea/
+
+# Compiled CircuitPython files
 *.mpy
+
+# macOS system files
 .Trashes
 .Spotlight*
 .DS_Store
-*.pyc
-__pycache__/
-.vscode/
-.idea/
-*.mpy
-.Trashes
-.Spotlight*
-.DS_Store
+
+# Prevent secrets from being committed
 settings.toml
 infra_controller/settings copy.toml
-infra_controller/settings copy.toml
+
+# Prevent root-level Python files from being tracked
+/*.py
+
+# Prevent root lib/sd folders if they’re duplicates
+/lib/
+/sd/
