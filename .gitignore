@@ -15,3 +15,5 @@ __pycache__/
 .Spotlight*
 .DS_Store
 settings.toml
+infra_controller/settings copy.toml
+infra_controller/settings copy.toml
