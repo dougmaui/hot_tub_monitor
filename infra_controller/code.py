@@ -1,254 +1,199 @@
-# Version: 2.3
+# code.py - Executive Module with Display and Sensor
+# Target Board: ESP32-S3 8MB (Infrastructure/WiFi Board)
+# Rev: 1.1 - Added sensor UART integration
+# Date: 2024-01-25
+"""
+Executive loop for ESP32-S3 Network Services
+Coordinates WiFi Manager, NTP Sync, MQTT Publisher, Display, and Sensor UART
+"""
 
-from time import sleep, monotonic
-import wifi
+import time
+import gc
 import os
-import array
-import math
+from config import WiFiConfig, MQTTConfig, DisplayConfig
+from wifi_manager import WiFiManager
+from ntp_sync import NTPSync
+from mqtt_publisher import MQTTPublisher
+from display_module import DisplayModule
+from sensor_handler import SensorHandler
+
+# Get credentials from environment
+WIFI_SSID = os.getenv("WIFI_SSID", "TestNetwork")
+WIFI_PASSWORD = os.getenv("WIFI_PASSWORD", "testpass")
+AIO_USERNAME = os.getenv("AIO_USERNAME")
+AIO_KEY = os.getenv("AIO_KEY")
 
 # Configuration
-START_HOURS, START_MINUTES, START_SECONDS = 0, 0, 0  # Start time: 00:00:00
-BUFFER_SECONDS = 60  # Store last 60 seconds of RSSI and channel
-DIAG_INTERVAL = 240  # Diagnostics every 1 minute (240 cycles at 0.25 s)
-SAMPLE_INTERVAL = 0.25  # Sample every 0.25 seconds (4 Hz)
-BUFFER_SIZE = int(BUFFER_SECONDS / SAMPLE_INTERVAL)  # 240 entries for 60 seconds
-RSSI_OUTLIER_THRESHOLD = 5  # dBm deviation for outlier detection
-
-# Circular buffers for RSSI, channel, and timestamps
-rssi_buffer = array.array("i", [0] * BUFFER_SIZE)  # Signed int for RSSI
-channel_buffer = array.array("i", [0] * BUFFER_SIZE)  # Signed int for channel
-buffer_timestamps = array.array("f", [0.0] * BUFFER_SIZE)  # Float for monotonic()
-buffer_index = 0
-
-# Variability tracking
-rssi_samples = []  # Store valid RSSI for variability calculation
-RSSI_WINDOW = BUFFER_SIZE  # 240 samples for 60 seconds
-outlier_count = 0  # Count RSSI outliers (>5 dBm from mean)
-
-start_time = monotonic()
+TICK_INTERVAL = 0.05  # 50ms main loop
+HEALTH_CHECK_INTERVAL = 60  # Check system health every minute
+ENABLE_SENSOR_UART = True  # Set False to disable sensor UART
 
 
-# Function to add seconds to time
-def add_seconds_direct(hours, minutes, seconds, n):
-    total_seconds = hours * 3600 + minutes * 60 + seconds + n
-    new_hours = total_seconds // 3600
-    total_seconds %= 3600
-    new_minutes = total_seconds // 60
-    new_seconds = total_seconds % 60
-    return f"{new_hours:02d}:{new_minutes:02d}:{new_seconds:02d}"
+def main():
+    """Main executive loop"""
+    print("Starting Network Services Executive...")
+    print(f"  Free memory: {gc.mem_free()} bytes")
 
+    # Initialize modules
+    wifi = WiFiManager(WIFI_SSID, WIFI_PASSWORD, start_time="12:00:00")
+    ntp = NTPSync()
 
-# Function to dump buffer
-def dump_buffer(current_time, cycle_count, pre_dropout_start=None):
-    print(
-        f"[{current_time}] Cycle {cycle_count}: Buffer contents (last {BUFFER_SECONDS} seconds):"
-    )
-    if pre_dropout_start is not None:
-        start_cycle = pre_dropout_start
+    # Initialize Display
+    display = DisplayModule()
+    print(f"  Display enabled: {display.enabled}")
+
+    # Initialize MQTT if credentials available
+    mqtt = None
+    if AIO_USERNAME and AIO_KEY and MQTTConfig.ENABLED:
+        mqtt = MQTTPublisher(
+            MQTTConfig.BROKER,
+            MQTTConfig.PORT,
+            AIO_USERNAME,
+            AIO_KEY,
+            max_queue_size=MQTTConfig.MAX_QUEUE_SIZE,
+            publishes_per_minute=MQTTConfig.PUBLISH_RATE_PROD
+        )
+        print(f"MQTT: Initialized for Adafruit IO user: {AIO_USERNAME}")
+        ssl_status = "SSL" if MQTTConfig.PORT == 8883 else "non-SSL"
+        print(f"MQTT: Using {ssl_status} connection, {MQTTConfig.PUBLISH_RATE_PROD}/minute")
     else:
-        start_cycle = cycle_count - BUFFER_SIZE + 1
-    data = [
-        {
-            "cycle": start_cycle + i,
-            "time": add_seconds_direct(
-                START_HOURS, START_MINUTES, START_SECONDS, int(t - start_time)
-            ),
-            "rssi": r,
-            "channel": c,
-        }
-        for i, (t, r, c) in enumerate(
-            zip(buffer_timestamps, rssi_buffer, channel_buffer)
-        )
-        if r != -999 and c != 0
-    ]
-    for entry in data:
-        print(
-            f"  Cycle {entry['cycle']}: {entry['time']}: RSSI {entry['rssi']} dBm, Channel {entry['channel']}"
-        )
-    print(f"[{current_time}] Printed {len(data)} values")
-    return len(data)
+        if not MQTTConfig.ENABLED:
+            print("MQTT: Disabled by configuration")
+        else:
+            print("MQTT: Disabled - no Adafruit IO credentials found")
 
+    # Initialize sensor handler if enabled
+    sensor = None
+    if ENABLE_SENSOR_UART:
+        sensor = SensorHandler()
+        if sensor.initialize():
+            print("Executive: Sensor UART enabled")
+        else:
+            print("Executive: Sensor UART failed to initialize")
+            sensor = None
+    else:
+        print("Executive: Sensor UART disabled by configuration")
 
-# Connect to Wi-Fi
-try:
-    wifi.radio.enabled = True
-    wifi.radio.connect(os.getenv("WIFI_SSID"), os.getenv("WIFI_PASSWORD"))
-    print("Wi-Fi connected")
-except Exception as e:
-    print(f"Wi-Fi connection failed: {e}")
+    # Health monitoring
+    last_health_check = time.monotonic()
+    last_mqtt_publish = time.monotonic()   # Track MQTT publish timing
 
-# Print initial info
-print("IP:", wifi.radio.ipv4_address or "Not connected")
+    print("Executive loop started")
+    print(f"  Free memory after init: {gc.mem_free()} bytes")
 
-cycle_count = 0
-last_connected = True
-dropout_detected = False
-in_simulated_dropout = False
-pre_dropout_cycle = None
+    while True:
+        # Always tick WiFi
+        wifi.tick()
 
-while True:
-    try:
-        cycle_count += 1
+        # Tick sensor if available
+        if sensor:
+            sensor.tick()
 
-        # Calculate uptime
-        uptime_seconds = monotonic() - start_time
-        hours = int(uptime_seconds // 3600)
-        minutes = int((uptime_seconds % 3600) // 60)
-        seconds = int(uptime_seconds % 60)
-        current_time = add_seconds_direct(
-            START_HOURS, START_MINUTES, START_SECONDS, int(uptime_seconds)
-        )
+        # Tick NTP if WiFi available
+        if wifi.is_available():
+            ntp.tick()
 
-        # Read RSSI and channel
-        rssi = None
-        channel = None
-        try:
-            ap = wifi.radio.ap_info
-            if ap and not in_simulated_dropout:
-                rssi = ap.rssi
-                channel = ap.channel
-                if not last_connected:
-                    print(
-                        f"[{current_time}] Cycle {cycle_count}: Reconnected after dropout"
-                    )
-                    dump_buffer(current_time, cycle_count, pre_dropout_cycle)
-                    dropout_detected = True
-                last_connected = True
+            # Handle NTP sync
+            if ntp.just_synced:
+                # Get timestamp in microseconds
+                timestamp_us = ntp.get_real_timestamp_us()
+                print(f"Executive: Passing timestamp {timestamp_us} µs to WiFi")
+                wifi.set_time_offset_us(timestamp_us)
+
+            # Tick MQTT if available and WiFi stable
+            if mqtt and not wifi.will_be_unavailable():
+                if not wifi.measuring:
+                    mqtt.tick()
+
+        # Update display - pass all modules so it can read their status
+        display.tick(wifi, ntp, mqtt, sensor)  # Now includes sensor
+
+        # Health monitoring
+        now = time.monotonic()
+        if now - last_health_check >= HEALTH_CHECK_INTERVAL:
+            free_mem = gc.mem_free()
+            status = wifi.get_status()
+            ntp_status = ntp.get_status()
+
+            # Single line health check
+            ts = wifi.get_timestamp()
+            state = status['state']
+            rssi = status['rssi']
+            ch = status['channel']
+            bssid = wifi.current_bssid or 'None'
+            ntp_qual = ntp_status['quality']
+            mem = free_mem
+
+            # Basic health line
+            print(f"{ts} Health: WiFi {state} RSSI:{rssi} Ch:{ch} BSSID:{bssid} | NTP:{ntp_qual} | Mem:{mem}", end="")
+
+            # Add MQTT status if available
+            if mqtt:
+                mqtt_status = mqtt.get_status()
+                mqtt_state = mqtt_status['state']
+                mqtt_queue = mqtt_status['queue_size']
+                mqtt_sent = mqtt_status['messages_sent']
+                print(f" | MQTT:{mqtt_state} Q:{mqtt_queue} Sent:{mqtt_sent}", end="")
+
+            # Add sensor status if available
+            if sensor:
+                sensor_status = sensor.get_status()
+                if sensor_status['online']:
+                    print(f" | Sensor:ON {sensor_status['temp_c']:.1f}°C", end="")
+                else:
+                    print(f" | Sensor:OFF", end="")
+
+            # Add display status
+            if display.enabled:
+                display_status = display.get_status()
+                print(f" | Display:ON Updates:{display_status['updates']}")
             else:
-                if last_connected and not in_simulated_dropout:
-                    pre_dropout_cycle = cycle_count - 1
-                if last_connected:
-                    dropout_detected = False
-                    last_connected = False
-                rssi = None
-                channel = None
-                print(f"[{current_time}] Cycle {cycle_count}: No active AP")
-        except Exception as e:
-            if last_connected and not in_simulated_dropout:
-                pre_dropout_cycle = cycle_count - 1
-            if last_connected:
-                dropout_detected = False
-                last_connected = False
-            rssi = None
-            channel = None
-            print(f"[{current_time}] Cycle {cycle_count}: AP info error: {e}")
+                print(" | Display:OFF")
 
-        # Store RSSI and channel in circular buffer (only if connected)
-        if last_connected and not in_simulated_dropout:
-            rssi_buffer[buffer_index] = rssi if rssi is not None else -999
-            channel_buffer[buffer_index] = channel if channel is not None else 0
-            buffer_timestamps[buffer_index] = monotonic()
-            buffer_index = (buffer_index + 1) % BUFFER_SIZE
+            # Emergency actions
+            if free_mem < MQTTConfig.MIN_MEMORY_WARNING:
+                print(f"  WARNING: Low memory! {free_mem} bytes")
 
-        # Track RSSI variability
-        if rssi is not None:
-            rssi_samples.append(rssi)
-            if len(rssi_samples) > RSSI_WINDOW:
-                rssi_samples.pop(0)
-            if len(rssi_samples) >= RSSI_WINDOW and cycle_count % DIAG_INTERVAL == 0:
-                mean_rssi = sum(rssi_samples) / len(rssi_samples)
-                variance = sum((x - mean_rssi) ** 2 for x in rssi_samples) / len(
-                    rssi_samples
-                )
-                std_dev = math.sqrt(variance) if variance > 0 else 0
-                min_rssi = min(rssi_samples)
-                max_rssi = max(rssi_samples)
-                outliers = sum(
-                    1
-                    for x in rssi_samples
-                    if abs(x - mean_rssi) > RSSI_OUTLIER_THRESHOLD
-                )
-                outlier_count += outliers
-                print(
-                    f"[{current_time}] Cycle {cycle_count}: RSSI Variability (last 60s): Mean {mean_rssi:.1f} dBm, Std Dev {std_dev:.1f} dBm, Min {min_rssi} dBm, Max {max_rssi} dBm, Outliers {outliers}, Total Outliers {outlier_count}"
-                )
+                # If critical, reduce MQTT activity but don't force GC
+                if free_mem < MQTTConfig.MIN_MEMORY_CRITICAL and mqtt:
+                    print("  CRITICAL: Clearing MQTT queue")
+                    # Clear the queue to reduce memory pressure
+                    queue_size = len(mqtt.queue)
+                    mqtt.queue.clear()
+                    mqtt.messages_dropped += queue_size
 
-        # Periodic reconnection with retry
-        if not last_connected and cycle_count % 40 == 0 and not in_simulated_dropout:
-            for _ in range(3):
-                try:
-                    wifi.radio.enabled = True
-                    wifi.radio.connect(
-                        os.getenv("WIFI_SSID"), os.getenv("WIFI_PASSWORD")
-                    )
-                    sleep(0.5)
-                    if wifi.radio.connected:
-                        print(f"[{current_time}] Cycle {cycle_count}: Reconnected")
-                        if not dropout_detected:
-                            print(
-                                f"[{current_time}] Cycle {cycle_count}: Reconnected after dropout"
-                            )
-                            dump_buffer(current_time, cycle_count)
-                            dropout_detected = True
-                        last_connected = True
-                        break
-                except Exception as e:
-                    print(
-                        f"[{current_time}] Cycle {cycle_count}: Reconnect failed: {e}"
-                    )
-                    sleep(0.5)
-            if not last_connected:
-                print(
-                    f"[{current_time}] Cycle {cycle_count}: All reconnect attempts failed"
-                )
+            last_health_check = now
 
-        # Debug: Print buffer status before dropout
-        if cycle_count == 479:
-            print(f"[{current_time}] Cycle {cycle_count}: Pre-dropout buffer status:")
-            dump_buffer(current_time, cycle_count)
+        # MQTT publishing on separate schedule
+        if mqtt and mqtt.is_connected() and (now - last_mqtt_publish >= MQTTConfig.HEALTH_PUBLISH_INTERVAL):
+            # Get current values
+            status = wifi.get_status()
+            rssi = status['rssi']
+            free_mem = gc.mem_free()
 
-        # Debug: Print buffer index at cycle 120 and 240
-        if cycle_count in (120, 240):
-            print(f"[{current_time}] Cycle {cycle_count}: Buffer index: {buffer_index}")
+            if free_mem > MQTTConfig.MIN_MEMORY_PUBLISH:  # Only publish if memory is reasonable
+                # Publish real RSSI
+                mqtt.publish_metric("rssi", rssi)
 
-        # Simulate 2-minute dropout
-        if cycle_count == 480:  # ~2 minutes (120s / 0.25s = 480 cycles)
-            print(f"[{current_time}] Cycle {cycle_count}: Simulating Wi-Fi dropout")
-            wifi.radio.enabled = False
-            wifi.radio.stop_station()
-            in_simulated_dropout = True
-        if cycle_count == 960:  # ~4 minutes (240s / 0.25s = 960 cycles)
-            print(f"[{current_time}] Cycle {cycle_count}: Ending simulated dropout")
-            wifi.radio.enabled = True
-            in_simulated_dropout = False
-            sleep(0.5)
-            for _ in range(3):
-                try:
-                    wifi.radio.connect(
-                        os.getenv("WIFI_SSID"), os.getenv("WIFI_PASSWORD")
-                    )
-                    sleep(0.5)
-                    if wifi.radio.connected:
-                        print(
-                            f"[{current_time}] Cycle {cycle_count}: Reconnected (post-dropout)"
-                        )
-                        if not dropout_detected:
-                            print(
-                                f"[{current_time}] Cycle {cycle_count}: Reconnected after dropout"
-                            )
-                            dump_buffer(current_time, cycle_count, pre_dropout_cycle)
-                            dropout_detected = True
-                        last_connected = True
-                        break
-                except Exception as e:
-                    print(
-                        f"[{current_time}] Cycle {cycle_count}: Post-dropout reconnect failed: {e}"
-                    )
-                    sleep(0.5)
+                # Publish temperature from sensor if available
+                if sensor and sensor.is_sensor_online():
+                    temp_c, temp_f = sensor.get_temperature()
+                    if temp_c is not None:
+                        mqtt.publish_metric("temp-c", round(temp_c, 2))
+                        mqtt.publish_metric("temp-f", round(temp_f, 1))
+                else:
+                    # Fallback to simulated temperature
+                    mqtt.publish_metric("temp-f", 98.6)
+                    mqtt.publish_metric("temp-c", 37.0)
 
-        # Diagnostics (every 1 minute)
-        if cycle_count % DIAG_INTERVAL == 0:
-            print(
-                f"[{current_time}] Cycle {cycle_count}: RSSI: {rssi if rssi is not None else 'N/A'} dBm, Channel: {channel if channel is not None else 'N/A'}"
-            )
+                # Still publish simulated pH for now (no pH sensor yet)
+                mqtt.publish_metric("ph", 7.2)
 
-        sleep(SAMPLE_INTERVAL)
+                last_mqtt_publish = now
 
-    except KeyboardInterrupt:
-        print(f"[{current_time}] Cycle {cycle_count}: KeyboardInterrupt detected")
-        dump_buffer(current_time, cycle_count)
-        raise
-    except Exception as e:
-        print(f"[{current_time}] Cycle {cycle_count}: ERROR: Unexpected error: {e}")
-        dump_buffer(current_time, cycle_count)
-        sleep(SAMPLE_INTERVAL)
+        # Maintain loop timing
+        time.sleep(TICK_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
