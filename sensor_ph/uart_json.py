@@ -1,9 +1,9 @@
-# uart_json.py - Minimal JSON UART Protocol Handler
+# uart_json.py - Minimal JSON UART Protocol Handler (with pH support)
 """
 Simple JSON message protocol for UART communication
 Handles basic send/receive with newline delimiters
+Updated to include pH in status messages
 """
-
 import json
 import time
 
@@ -25,17 +25,28 @@ class UARTProtocol:
 
         print(f"UART Protocol initialized as {role}")
 
-    def send_status(self, temp_c, temp_f, rtd_mode="MONITOR"):
-        """Send a status message (sensor side)"""
+    def send_status(self, temp_c, temp_f, rtd_mode="MONITOR", ph=None):
+        """Send a status message (sensor side)
+        
+        Args:
+            temp_c: Temperature in Celsius
+            temp_f: Temperature in Fahrenheit
+            rtd_mode: RTD operating mode
+            ph: pH value (optional)
+        """
         message = {
             "type": "status",
-            "timestamp": time.monotonic(),  # Simple timestamp for now
+            "timestamp": time.monotonic(),
             "sensors": {
-                "temp_c": round(temp_c, 3),
-                "temp_f": round(temp_f, 3),
+                "temp_c": round(temp_c, 3) if temp_c is not None else None,
+                "temp_f": round(temp_f, 3) if temp_f is not None else None,
                 "rtd_mode": rtd_mode
             }
         }
+
+        # Add pH if provided
+        if ph is not None:
+            message["sensors"]["ph"] = round(ph, 3)
 
         self._send_message(message)
 
@@ -47,7 +58,6 @@ class UARTProtocol:
             "id": f"cmd_{self.message_count}",
             "cmd": cmd
         }
-
         if params:
             message["params"] = params
 
@@ -61,9 +71,6 @@ class UARTProtocol:
 
             # Send over UART
             self.uart.write(json_str.encode('utf-8'))
-
-            # Debug print (remove in production)
-            print(f"TX: {json_str.strip()}")
 
         except Exception as e:
             print(f"Send error: {e}")
@@ -102,10 +109,7 @@ class UARTProtocol:
                 message = json.loads(line)
                 messages.append(message)
 
-                # Debug print (remove in production)
-                print(f"RX: {line}")
-
-            except ValueError as e:
+            except ValueError as e:  # CircuitPython uses ValueError not JSONDecodeError
                 print(f"JSON parse error: {e}")
                 print(f"Bad line: {line}")
 
@@ -115,41 +119,3 @@ class UARTProtocol:
             self.rx_buffer = ""
 
         return messages
-
-
-# Test function for standalone testing
-def test_protocol():
-    """Test the protocol handler standalone"""
-    import board
-    import busio
-
-    # Set up UART
-    uart = busio.UART(board.TX, board.RX, baudrate=115200, timeout=0.1)
-
-    # Create protocol handler
-    protocol = UARTProtocol(uart, role="sensor")
-
-    print("Testing UART JSON Protocol")
-    print("Sending test status message...")
-
-    # Send a test status
-    protocol.send_status(27.543, 81.6, "MONITOR")
-
-    # Check for incoming
-    print("\nWaiting for incoming messages...")
-
-    start = time.monotonic()
-    while time.monotonic() - start < 10:
-        messages = protocol.process_rx()
-        for msg in messages:
-            print(f"\nReceived message:")
-            print(f"  Type: {msg.get('type')}")
-            print(f"  Content: {msg}")
-
-        time.sleep(0.1)
-
-    print("\nTest complete")
-
-
-if __name__ == "__main__":
-    test_protocol()

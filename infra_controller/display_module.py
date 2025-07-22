@@ -184,15 +184,20 @@ class DisplayModule:
             if sensor and sensor.is_sensor_online():
                 temp_c, temp_f = sensor.get_temperature()
                 if temp_c is not None:
-                    self.temp_label.text = f"{temp_c:.3f} C  {temp_f:.3f} F"
+                    self.temp_label.text = f"{temp_c:.3f} C {temp_f:.3f} F"
                 else:
-                    self.temp_label.text = "--.--- C  --.--- F"
+                    self.temp_label.text = "--.--- C --.--- F"
+
+                # Update pH from sensor (CHANGED)
+                ph = sensor.get_ph()
+                if ph is not None:
+                    self.ph_label.text = f"pH: {ph:.3f}"
+                else:
+                    self.ph_label.text = "pH: -.---"
             else:
                 # Fallback to test data if no sensor
                 self.temp_label.text = "No Sensor Data"
-
-            # pH still simulated for now
-            self.ph_label.text = "pH:  7.234"
+                self.ph_label.text = "pH: No Data"
 
             # Update WiFi status
             wifi_status = wifi_mgr.get_status()

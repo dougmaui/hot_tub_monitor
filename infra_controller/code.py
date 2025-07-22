@@ -181,13 +181,16 @@ def main():
                     if temp_c is not None:
                         mqtt.publish_metric("temp-c", round(temp_c, 2))
                         mqtt.publish_metric("temp-f", round(temp_f, 1))
+
+                    # Publish real pH
+                    ph = sensor.get_ph()
+                    if ph is not None:
+                        mqtt.publish_metric("ph", round(ph, 3))
                 else:
-                    # Fallback to simulated temperature
+                    # Fallback to simulated values
                     mqtt.publish_metric("temp-f", 98.6)
                     mqtt.publish_metric("temp-c", 37.0)
-
-                # Still publish simulated pH for now (no pH sensor yet)
-                mqtt.publish_metric("ph", 7.2)
+                    mqtt.publish_metric("ph", 7.2)
 
                 last_mqtt_publish = now
 
